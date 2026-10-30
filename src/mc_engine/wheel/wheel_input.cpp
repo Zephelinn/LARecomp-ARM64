@@ -1618,6 +1618,12 @@ void WheelThread() {
 }
 
 void EnsureThread() {
+#if defined(__ANDROID__)
+    // android: there is one SDL here, the SDK's (on Windows this file has its own copy), so a second thread
+    // initialising and polling its joystick layer would share state with the SDK's input driver, which this file
+    // is written to stay away from. No wheel support on Android; gamepads go through the SDK's input driver.
+    return;
+#endif
     Shared& sh = S();
     if (!sh.started.exchange(true)) {
         std::thread(WheelThread).detach();

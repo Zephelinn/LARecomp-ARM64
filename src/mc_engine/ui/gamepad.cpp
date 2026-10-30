@@ -71,6 +71,13 @@ XInputGetStateFn LoadXInput() {
 void EnsurePadLayer() {
   static std::once_flag once;
   std::call_once(once, [] {
+#if defined(__ANDROID__)
+    // android: there is one SDL, the SDK's, and its event loop drives the game's input. Disabling gamepad
+    // events or drivers here took every controller away from the game (no Start on the title screen). Only
+    // read the state that loop keeps current.
+    g_layer_up = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+    return;
+#endif
     // The wheel code's hints (wheel_input.cpp, WheelThread): this SDL must not
     // open pads through the drivers that would take them from the SDK's SDL.
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
@@ -98,7 +105,9 @@ std::vector<PadInfo> ListPads() {
   std::vector<PadInfo> pads;
   if (!g_layer_up) return pads;
   // Picks up devices that came or went since the last call.
+#if !defined(__ANDROID__)  // android: the SDK's event loop updates them
   SDL_UpdateJoysticks();
+#endif
   int count = 0;
   if (SDL_JoystickID* ids = SDL_GetJoysticks(&count)) {
     for (int i = 0; i < count; ++i) {
@@ -167,7 +176,9 @@ void MenuGamepad::Feed(ImGuiIO& io) {
   // Everything else SDL has a DirectInput mapping for. An Xbox pad mapped
   // here as well reads twice; the presses are merged, so that is harmless.
   if (g_layer_up) {
+#if !defined(__ANDROID__)  // android: the SDK's event loop updates them
     SDL_UpdateGamepads();
+#endif
     int count = 0;
     std::unordered_map<uint32_t, SDL_Gamepad*> next;
     if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {

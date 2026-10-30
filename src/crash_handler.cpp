@@ -4,6 +4,7 @@
 // This file is yours to edit. 'rexglue migrate' will NOT overwrite it.
 
 #include "crash_handler.h"
+#include <rex/filesystem.h>  // android: ExeDir
 #include "larecomp_log.h"
 
 #include <filesystem>
@@ -258,6 +259,10 @@ std::filesystem::path ExeDir() {
 void InstallCrashLogger() {}
 
 std::filesystem::path ExeDir() {
+#if defined(__ANDROID__)
+    // android: the process is app_process; the game folder sits in the app's files directory
+    return rex::filesystem::GetExecutableFolder();
+#endif
     try {
         return std::filesystem::canonical("/proc/self/exe").parent_path();
     } catch (...) {

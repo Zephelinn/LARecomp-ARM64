@@ -4,7 +4,10 @@
 > At this point, I'm not granting permission to use LARecomp's features in your own recomps. Once we officially launch, feel free to use our code as a reference, but please don't copy and paste our code.
 > Contributions to the repository are welcome.
 
-A static recompilation of **Midnight Club: Los Angeles (Complete Edition)** for Windows x86-64, built on the [ReXGlue SDK](https://github.com/rexglue/rexglue).
+> [!NOTE]
+> **LARecomp-ARM64** is a fork of [mzzvxm/LARecomp](https://github.com/mzzvxm/LARecomp) that adds **Android (ARM64)** support. It follows upstream closely and merges its updates often. All credit for LARecomp goes to its authors (see Credits); the Android changes are listed in [documentation/ANDROID.md](documentation/ANDROID.md). Android install steps are under [Android (ARM64)](#android-arm64), and the APK is on the [Releases](../../releases) page.
+
+A static recompilation of **Midnight Club: Los Angeles (Complete Edition)** for Windows x86-64 and Android (ARM64), built on the [ReXGlue SDK](https://github.com/rexglue/rexglue).
 
 Static recompilation translates the Xbox 360 PowerPC code inside the game's `default.xex` into native C++ that compiles and runs on a PC. There is no emulator and no interpreter in the loop. File I/O, GPU commands, audio and threading go through the ReXGlue runtime.
 
@@ -105,6 +108,26 @@ $env:REX_LOG_LEVEL="warn"; Start-Process larecomp.exe
 **Set `REX_LOG_LEVEL=warn`.** Non-Release builds log at `trace`, which is roughly 7,500 lines and 1.4 MB of synchronous disk writes per second during gameplay. That is enough to cause stutter on its own.
 
 Everything else is in the pause menu. It defaults to 60 FPS with real frame delta on and vsync off.
+
+### Android (ARM64)
+
+You need an ARM64 Android 11+ device with Vulkan (developed on a Snapdragon 8 Elite; Snapdragon 8 Gen 1 or newer recommended), a controller (there are no touch controls yet), about 6.5 GB of free space, and your own copy of the game.
+
+1. Download the APK from [Releases](../../releases) and install it (allow installing from unknown sources when asked).
+2. Open the app once and close it. This creates its folder, `Android/data/org.larecomp.android/files/`.
+3. Extract the game from your disc image on a PC, with any Xbox 360 ISO extractor or the included script:
+   ```
+   python android/scripts/xiso_extract.py "Midnight Club LA.iso" MCLA_Game_Files
+   ```
+4. Copy `default.xex` and all the `xarchive_*.rpf` files into `Android/data/org.larecomp.android/files/game/` on the device. Over USB from a PC (file transfer mode) is the simplest way; most Android file manager apps are not allowed to write into `Android/data`. With adb:
+   ```
+   adb push MCLA_Game_Files/. /sdcard/Android/data/org.larecomp.android/files/game/
+   ```
+5. Start the app. The first minutes stutter while shaders compile; they are kept, so later sessions are smoother.
+
+Tips: **FPS LIMIT 30** in the pause menu gives evenly paced frames on phones that cannot hold 60; CHEAP CAR SHADOW, SCREEN BLUR and the LOD options under Performance trade a little detail for frame rate. Logs are in `log.txt` and `logs/` next to the `game` folder. Uninstalling the app deletes that folder, game files included.
+
+Building for Android is described in [documentation/ANDROID.md](documentation/ANDROID.md#building).
 
 ---
 

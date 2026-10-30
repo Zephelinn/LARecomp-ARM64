@@ -34,7 +34,7 @@
 #include <windows.h>
 #include <commdlg.h>
 
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)  // android: no desktop file dialogs
 #else
 #include <gtk/gtk.h>
 #endif
@@ -118,6 +118,9 @@ std::filesystem::path PickIsoFile() {
 std::filesystem::path PickIsoFile() {
   return larecomp::PickIsoFileMacOS();
 }
+#elif defined(__ANDROID__)
+// android: no file dialog; the ISO is copied to the app's files directory instead.
+std::filesystem::path PickIsoFile() { return {}; }
 #else
 std::filesystem::path PickIsoFile() {
   GtkWidget* dialog = gtk_file_chooser_dialog_new(

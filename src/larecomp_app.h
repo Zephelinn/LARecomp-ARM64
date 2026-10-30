@@ -16,8 +16,10 @@
 #include "mc_engine/hooks/hooks.h"
 #include "native_gfx/nocp/nocp_app.h"
 #include "native_gfx/native_gfx.h"
+#if defined(_WIN32)  // android: the D3D12 runtime is Windows-only (native_gfx_off.cpp elsewhere)
 #include "native_gfx/d3d12/device_manager.h"
 #include "native_gfx/d3d12/swapchain.h"
+#endif
 #if defined(LARECOMP_HAS_GPU)
 #include "gpu/gpu.h"
 #endif
@@ -289,6 +291,30 @@ class LarecompApp : public rex::ReXApp {
     // (mc_engine/hooks/readback_window.cpp).
     SetFlag("vulkan_readback_resolve", "false");
     SetFlag("readback_memexport_fast", "true");
+#if defined(__ANDROID__)
+    // android: Qualcomm's driver allocates on every vkCmdBeginRendering, and the command processor begins one at
+    // every render target change: 26% of its time in a profile on the Odin 3. Classic cached render passes
+    // doubled the frame rate there (5 -> 11 fps). MCLA_VK_DYNAMIC_RENDERING=1 (args.txt) puts it back.
+    {
+      const char* dyn = std::getenv("MCLA_VK_DYNAMIC_RENDERING");
+      SetFlag("vulkan_dynamic_rendering", (dyn && *dyn == '1') ? "true" : "false");
+      // Adreno renders in on-chip tiles and the Xenos emulation loads and stores whole render targets around
+      // every render pass, so 4x MSAA multiplies that memory traffic by four. MCLA_MSAA=1 keeps the game's MSAA.
+      const char* msaa = std::getenv("MCLA_MSAA");
+      SetFlag("disable_msaa", (msaa && *msaa == '1') ? "false" : "true");
+      // One submission per frame instead of one per guest primary buffer: every submission resets a command
+      // pool, which costs a lot in Qualcomm's driver (7.6% of the command processor in the profile).
+      // MCLA_VK_SUBMIT_EACH_BUFFER=1 puts the SDK default back.
+      const char* each = std::getenv("MCLA_VK_SUBMIT_EACH_BUFFER");
+      SetFlag("vulkan_submit_on_primary_buffer_end", (each && *each == '1') ? "true" : "false");
+      // The SDK's frame-end reset of uploaded guest memory pages re-uploads every page in use each frame
+      // (22-35 MB per frame on the Odin 3; 7-9 MB without it, 27-39 -> 31-42 fps). Without it, writes the page
+      // tracking misses stay stale: the car's ground shadow shows as a pale rectangle. MCLA_PAGE_RESET=1 puts
+      // the reset back.
+      const char* page_reset = std::getenv("MCLA_PAGE_RESET");
+      SetFlag("clear_memory_page_state", (page_reset && *page_reset == '1') ? "true" : "false");
+    }
+#endif
 
     // BadassBaboon: Asynchronously submit D3D12 command lists as primary PM4 buffers finish.
     // Allows physical GPU execution to overlap with CPU command recording and reduces queue bubbles.

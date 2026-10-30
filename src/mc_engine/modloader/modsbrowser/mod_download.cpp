@@ -30,6 +30,7 @@ constexpr SocketHandle kNoSocket = INVALID_SOCKET;
 static void CloseSocket(SocketHandle s) { closesocket(s); }
 #else
 #include <netdb.h>
+#include <netinet/in.h>  // android: IPPROTO_TCP
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>

@@ -1,0 +1,2980 @@
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 41e6dce..08a0a4f 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -51,7 +51,12 @@ function(rexglue_apply_target_settings target_name)
+             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
+             target_compile_options(${target_name} PRIVATE -mcmodel=large)
+         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+-            target_compile_options(${target_name} PRIVATE -march=armv8-a)
++            # android: REXGLUE_ARM64_MARCH lets a build target newer cores (armv8.2-a: inline LSE atomics and
++            # more); armv8-a stays the default.
++            if(NOT REXGLUE_ARM64_MARCH)
++                set(REXGLUE_ARM64_MARCH armv8-a)
++            endif()
++            target_compile_options(${target_name} PRIVATE -march=${REXGLUE_ARM64_MARCH})
+         endif()
+     endif()
+ 
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..bc4eda8 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,8 +116,9 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__ANDROID__)
+ // Apple libc++ does not expose clock_time_conversion or clock_cast.
++// android: neither does the NDK's libc++.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
+@@ -125,6 +126,26 @@ template <class DestClock, class SourceClock, class Duration>
+ auto clock_cast(const std::chrono::time_point<SourceClock, Duration>& t) {
+   return clock_time_conversion<DestClock, SourceClock>{}(t);
+ }
++
++// android: file times to and from system time (file write times shown in the UI), through the two clocks' now().
++template <>
++struct clock_time_conversion<std::chrono::system_clock, std::chrono::file_clock> {
++  template <typename Duration>
++  std::chrono::system_clock::time_point operator()(
++      const std::chrono::time_point<std::chrono::file_clock, Duration>& t) const {
++    return std::chrono::system_clock::now() +
++           std::chrono::duration_cast<std::chrono::system_clock::duration>(t - std::chrono::file_clock::now());
++  }
++};
++template <>
++struct clock_time_conversion<std::chrono::file_clock, std::chrono::system_clock> {
++  template <typename Duration>
++  std::chrono::file_clock::time_point operator()(
++      const std::chrono::time_point<std::chrono::system_clock, Duration>& t) const {
++    return std::chrono::file_clock::now() +
++           std::chrono::duration_cast<std::chrono::file_clock::duration>(t - std::chrono::system_clock::now());
++  }
++};
+ #endif
+ 
+ template <>
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index dce3dbf..6e2d4a5 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -974,6 +974,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
+   spv::Id var_main_tfetch_gradients_v_;
+   // float4[register_count()].
+   spv::Id var_main_registers_;
++  // android: one float4 variable per register instead of var_main_registers_ when the shader never addresses
++  // registers dynamically (spirv_registers_as_variables). Mobile compilers (Adreno) keep a function-local
++  // array in scratch memory; separate variables stay in hardware registers.
++  std::vector<spv::Id> var_main_registers_individual_;
++  // Pointer to register register_index (and one component of it unless component is UINT32_MAX), from
++  // whichever of the two representations above exists.
++  spv::Id RegisterPointer(uint32_t register_index, uint32_t component = UINT32_MAX);
+   // Memory export variables are created only when needed.
+   // float4.
+   spv::Id var_main_memexport_address_;
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b..c906ee4 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -140,6 +140,10 @@ class SharedMemory {
+   virtual bool UploadRanges(
+       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+ 
++  // android: called by RequestRanges with the requested byte ranges (sorted, merged) after their upload, so
++  // a backend can tell which ranges the GPU work recorded since some point reads (VulkanSharedMemory).
++  virtual void OnRangesRequested(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {}
++
+  private:
+   memory::Memory& memory_;
+ 
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..6e3b234 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -202,8 +202,16 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Must be called before doing anything outside the render pass scope,
+   // including adding pipeline barriers that are not a part of the render pass
+   // scope. Submission must be open.
++  // android: no-op inside a hoisted region (IsHoistingRegion), whose commands run before the open pass.
+   void EndRenderPass();
+ 
++  // android: while a hoisted region is open, everything recorded (dispatches, copies, barriers) goes to
++  // before the open render pass instead of ending it (DeferredCommandBuffer::BeginHoistRegion). Used for
++  // texture requests (vulkan_hoist_texture_loads). AbortHoistRegion is for work that turns out to conflict
++  // with draws already recorded in the pass: the region's commands move back after a real pass end.
++  bool IsHoistingRegion() const { return hoist_region_open_; }
++  void AbortHoistRegion();
++
+   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
+       SingleTransientDescriptorLayout transient_descriptor_layout) const {
+     return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
+@@ -566,6 +574,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Temporary storage with reusable memory for writing image and sampler
+   // descriptors.
+   std::vector<VkDescriptorImageInfo> descriptor_write_image_info_;
++  // android: the texture and sampler infos last written to the current vertex / pixel texture descriptor set
++  // and that set's layout. A draw with identical bindings keeps the set instead of writing a new one
++  // (vkUpdateDescriptorSets is expensive on mobile drivers). Valid only while the matching
++  // current_graphics_descriptor_set_values_up_to_date_ bit is set, which a frame opening clears.
++  std::vector<VkDescriptorImageInfo> last_texture_image_info_[2];
++  VkDescriptorSetLayout last_texture_set_layout_[2] = {};
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
+ 
+@@ -795,6 +809,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+   bool in_render_pass_ = false;
+ 
++  // android: hoisted region (IsHoistingRegion).
++  bool hoist_region_open_ = false;
++  size_t hoist_region_start_ = 0;
++  std::vector<uintmax_t> hoist_region_commands_;
++  // DeferredCommandBuffer::pass_serial of the last render pass with a draw that may memexport (uses the
++  // scratch buffer and writes guest memory: no hoisting into that pass).
++  uint64_t memexport_pass_serial_ = UINT64_MAX;
++
+   // Currently bound graphics pipeline, either from the pipeline cache (with
+   // potentially deferred creation - current_external_graphics_pipeline_ is
+   // VK_NULL_HANDLE in this case) or a non-Xenos one
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a848..d3b0359 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -10,6 +10,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+@@ -23,6 +25,15 @@ namespace rex::graphics::vulkan {
+ 
+ class VulkanCommandProcessor;
+ 
++// android: counters for the vulkan_gpu_profile summary (reset with every summary).
++struct GpuProfileCounters {
++  std::atomic<uint64_t> upload_bytes{0};
++  std::atomic<uint64_t> uploads{0};
++  std::atomic<uint64_t> texture_loads{0};
++  std::atomic<uint64_t> texture_load_bytes{0};
++};
++GpuProfileCounters& gpu_profile_counters();
++
+ class DeferredCommandBuffer {
+  public:
+   DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
+@@ -31,6 +42,10 @@ class DeferredCommandBuffer {
+   void Reset();
+   void Execute(VkCommandBuffer command_buffer);
+ 
++  // android: GPU timing by category (vulkan_gpu_profile). The kind of the next render pass begun.
++  enum PassKind : uint32_t { kPassGuest, kPassRenderTargetCache, kPassPresent, kPassKindCount };
++  void SetNextPassKind(PassKind kind) { next_pass_kind_ = kind; }
++
+   // render_pass_begin->pNext of all barriers must be null.
+   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
+                             VkSubpassContents contents) {
+@@ -51,10 +66,17 @@ class DeferredCommandBuffer {
+     args.render_area = render_pass_begin->renderArea;
+     args.clear_value_count = clear_value_count;
+     args.contents = contents;
++    args.profile_kind = next_pass_kind_;
++    next_pass_kind_ = kPassGuest;
+     if (clear_value_count) {
+       std::memcpy(args_ptr + clear_values_offset, render_pass_begin->pClearValues,
+                   sizeof(VkClearValue) * clear_value_count);
+     }
++    BeginPassArea(args_ptr + offsetof(ArgsVkBeginRenderPass, render_area));
++    open_pass_header_offset_ =
++        size_t(reinterpret_cast<uintmax_t*>(args_ptr) - command_stream_.data()) -
++        kCommandHeaderSizeElements;
++    ++pass_serial_;
+   }
+ 
+   void CmdVkBindDescriptorSets(VkPipelineBindPoint pipeline_bind_point, VkPipelineLayout layout,
+@@ -133,6 +155,12 @@ class DeferredCommandBuffer {
+     args.rect_count = rect_count;
+     attachments_out = reinterpret_cast<VkClearAttachment*>(args_ptr + attachments_offset);
+     rects_out = reinterpret_cast<VkClearRect*>(args_ptr + rects_offset);
++    // android: the caller fills the rects after this returns: read them when the pass ends.
++    if (pass_area_offset_ != kNoPass) {
++      pass_clear_rects_.push_back(
++          {size_t(args_ptr + rects_offset - reinterpret_cast<uint8_t*>(command_stream_.data())),
++           rect_count});
++    }
+   }
+   void CmdVkClearAttachments(uint32_t attachment_count, const VkClearAttachment* attachments,
+                              uint32_t rect_count, const VkClearRect* rects) {
+@@ -234,6 +262,7 @@ class DeferredCommandBuffer {
+ 
+   void CmdVkDraw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
+                  uint32_t first_instance) {
++    AddDrawToPassArea();
+     auto& args = *reinterpret_cast<ArgsVkDraw*>(WriteCommand(Command::kVkDraw, sizeof(ArgsVkDraw)));
+     args.vertex_count = vertex_count;
+     args.instance_count = instance_count;
+@@ -243,6 +272,7 @@ class DeferredCommandBuffer {
+ 
+   void CmdVkDrawIndexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                         int32_t vertex_offset, uint32_t first_instance) {
++    AddDrawToPassArea();
+     auto& args = *reinterpret_cast<ArgsVkDrawIndexed*>(
+         WriteCommand(Command::kVkDrawIndexed, sizeof(ArgsVkDrawIndexed)));
+     args.index_count = index_count;
+@@ -259,11 +289,37 @@ class DeferredCommandBuffer {
+     args.query = query;
+   }
+ 
+-  void CmdVkEndRenderPass() { WriteCommand(Command::kVkEndRenderPass, 0); }
++  void CmdVkEndRenderPass() {
++    EndPassArea();
++    open_pass_header_offset_ = kNoPass;
++    WriteCommand(Command::kVkEndRenderPass, 0);
++  }
+ 
+   // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
+   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
+-  void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
++  void CmdVkEndRendering() {
++    EndPassArea();
++    open_pass_header_offset_ = kNoPass;
++    WriteCommand(Command::kVkEndRendering, 0);
++  }
++
++  // android: between BeginHoist and EndHoist, copies into `buffer` are recorded to execute right before the
++  // render pass that is open now instead of inside it. Execute surrounds all the copies hoisted before one
++  // pass with a single pair of barriers: after earlier reads (read_stage_mask) and writes of the buffer, and
++  // making the copies visible to read_stage_mask/read_access_mask. Used for shared memory uploads that would
++  // otherwise split the pass (VulkanSharedMemory::UploadRanges).
++  bool IsRenderPassOpen() const { return open_pass_header_offset_ != kNoPass; }
++  // Changes with every render pass begun.
++  uint64_t pass_serial() const { return pass_serial_; }
++  void BeginHoist(VkBuffer buffer, VkPipelineStageFlags read_stage_mask, VkAccessFlags read_access_mask);
++  void EndHoist();
++  // A general hoisted region (VulkanCommandProcessor::BeginHoistRegion): any commands valid outside a render
++  // pass, with their own barriers. Returns the region's start for TakeHoistRegion, which removes the region's
++  // commands again (to be appended to the main stream with AppendRaw after the pass is really ended).
++  size_t BeginHoistRegion();
++  void EndHoistRegion();
++  void TakeHoistRegion(size_t region_start, std::vector<uintmax_t>& commands_out);
++  void AppendRaw(const std::vector<uintmax_t>& commands);
+ 
+   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
+     auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
+@@ -317,6 +373,10 @@ class DeferredCommandBuffer {
+     args.first_scissor = first_scissor;
+     args.scissor_count = scissor_count;
+     std::memcpy(args_ptr + header_size, scissors, sizeof(VkRect2D) * scissor_count);
++    if (first_scissor == 0 && scissor_count) {
++      scissor_ = scissors[0];
++      scissor_valid_ = true;
++    }
+   }
+ 
+   void CmdVkSetStencilCompareMask(VkStencilFaceFlags face_mask, uint32_t compare_mask) {
+@@ -396,6 +456,7 @@ class DeferredCommandBuffer {
+     VkRect2D render_area;
+     uint32_t clear_value_count;
+     VkSubpassContents contents;
++    uint32_t profile_kind;
+     // Followed by aligned optional VkClearValue[].
+     static_assert(alignof(VkClearValue) <= alignof(uintmax_t));
+   };
+@@ -406,6 +467,7 @@ class DeferredCommandBuffer {
+     uint32_t layer_count;
+     uint32_t view_mask;
+     uint32_t color_attachment_count;
++    uint32_t profile_kind;
+     bool has_depth_attachment;
+     bool has_stencil_attachment;
+     // Followed by:
+@@ -579,6 +641,125 @@ class DeferredCommandBuffer {
+ 
+   void* WriteCommand(Command command, size_t arguments_size_bytes);
+ 
++  // android: hoisting (BeginHoist).
++  struct HoistBlock {
++    size_t anchor;  // Element offset of the render pass begin command in command_stream_.
++    size_t begin, end;  // Element range in hoist_stream_.
++    VkBuffer buffer;
++    VkPipelineStageFlags read_stage_mask;
++    VkAccessFlags read_access_mask;
++  };
++  std::vector<uintmax_t>* write_stream_ = &command_stream_;
++  std::vector<uintmax_t> hoist_stream_;
++  std::vector<HoistBlock> hoist_blocks_;
++  size_t hoist_block_index_ = 0;
++  size_t hoist_region_after_barrier_ = 0;
++  size_t open_pass_header_offset_ = SIZE_MAX;
++  uint64_t pass_serial_ = 0;
++  uint8_t profile_pass_kind_ = 0;
++  uint32_t profile_pass_draws_ = 0, profile_pass_width_ = 0, profile_pass_height_ = 0;
++
++  // android: render area trimming (vulkan_trim_render_area). Render targets are allocated at the full EDRAM
++  // height (1280x2048 for a 720p target) and every pass used to begin with that whole extent as its render
++  // area, so a tiling GPU loaded and stored ~3x the pixels the game draws on every pass. While a pass is
++  // recorded, the scissors of its draws and its clear rects are accumulated, and its recorded render area is
++  // replaced by their bounds when it ends. Load/store ops only touch the render area, so the contents outside
++  // it are kept.
++  static constexpr size_t kNoPass = SIZE_MAX;
++  void BeginPassArea(uint8_t* render_area_ptr);
++  void AddDrawToPassArea() {
++    if (pass_area_offset_ == kNoPass) {
++      return;
++    }
++    if (!scissor_valid_) {
++      pass_area_full_ = true;
++      return;
++    }
++    AddRectToPassArea(scissor_);
++  }
++  void AddRectToPassArea(const VkRect2D& rect) {
++    if (!rect.extent.width || !rect.extent.height) {
++      return;
++    }
++    int64_t x0 = rect.offset.x, y0 = rect.offset.y;
++    int64_t x1 = x0 + rect.extent.width, y1 = y0 + rect.extent.height;
++    if (pass_area_empty_) {
++      pass_x0_ = x0;
++      pass_y0_ = y0;
++      pass_x1_ = x1;
++      pass_y1_ = y1;
++      pass_area_empty_ = false;
++    } else {
++      pass_x0_ = std::min(pass_x0_, x0);
++      pass_y0_ = std::min(pass_y0_, y0);
++      pass_x1_ = std::max(pass_x1_, x1);
++      pass_y1_ = std::max(pass_y1_, y1);
++    }
++  }
++  void EndPassArea();
++
++  struct PassClearRects {
++    size_t offset_bytes;
++    uint32_t count;
++  };
++  bool trim_render_area_ = true;
++  size_t pass_area_offset_ = kNoPass;
++  bool pass_area_full_ = false;
++  bool pass_area_empty_ = true;
++  int64_t pass_x0_ = 0, pass_y0_ = 0, pass_x1_ = 0, pass_y1_ = 0;
++  std::vector<PassClearRects> pass_clear_rects_;
++  VkRect2D scissor_ = {};
++  bool scissor_valid_ = false;
++
++  // android: GPU profiler (vulkan_gpu_profile). Execute writes a bottom-of-pipe timestamp before and after
++  // every render pass and dispatch; the time up to a timestamp is charged to the segment it closes. A ring of
++  // query pools is read back without waiting a few submissions later, and a summary is logged every few
++  // seconds.
++  enum SegmentKind : uint8_t {
++    kSegPassGuest,
++    kSegPassRenderTargetCache,
++    kSegPassPresent,
++    kSegDispatch,
++    kSegOther,
++    kSegHoisted,
++    kSegKindCount
++  };
++  struct ProfileStamp {
++    uint8_t kind;
++    uint32_t draws;
++    uint32_t width, height;
++  };
++  struct ProfilePool {
++    VkQueryPool pool = VK_NULL_HANDLE;
++    std::vector<ProfileStamp> stamps;
++    bool pending = false;
++  };
++  static constexpr uint32_t kProfilePoolCount = 4;
++  static constexpr uint32_t kProfileQueriesPerPool = 4096;
++  PassKind next_pass_kind_ = kPassGuest;
++  bool profile_enabled_ = false;
++  bool profile_failed_ = false;
++  float timestamp_period_ns_ = 1.0f;
++  ProfilePool profile_pools_[kProfilePoolCount];
++  uint32_t profile_pool_index_ = 0;
++  ProfilePool* ProfileBegin(VkCommandBuffer command_buffer);
++  void ProfileCollect(ProfilePool& pool);
++  void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
++                     size_t stream_remaining, ProfilePool* profile, bool is_main);
++  void ProfileStampWrite(VkCommandBuffer command_buffer, ProfilePool* pool, SegmentKind kind,
++                         uint32_t draws = 0, uint32_t width = 0, uint32_t height = 0);
++  struct ProfileTop {
++    double ms;
++    uint8_t kind;
++    uint32_t draws, width, height;
++  };
++  uint64_t profile_window_start_ns_ = 0;
++  uint32_t profile_window_submissions_ = 0;
++  double profile_window_ms_[kSegKindCount] = {};
++  uint32_t profile_window_count_[kSegKindCount] = {};
++  double profile_window_span_ms_ = 0.0;
++  std::vector<ProfileTop> profile_top_;
++
+   const VulkanCommandProcessor& command_processor_;
+ 
+   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 7b938b9..8cad77e 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -431,6 +431,17 @@ class VulkanPipelineCache {
+ 
+   // Currently open shader storage path.
+   std::filesystem::path shader_storage_cache_root_;
++
++  // android: the driver's compiled pipelines, kept across runs (vulkan_pipeline_cache_file) in
++  // <cache root>/vulkan_pipeline_cache.bin. Saved by pipeline creation threads after new pipelines (Android
++  // may kill the process without a shutdown) and in ShutdownShaderStorage.
++  void LoadVulkanPipelineCache(const std::filesystem::path& cache_root);
++  void SaveVulkanPipelineCache(bool force);
++  VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
++  std::filesystem::path vk_pipeline_cache_path_;
++  std::mutex vk_pipeline_cache_save_mutex_;
++  std::atomic<uint32_t> vk_pipeline_cache_unsaved_{0};
++  std::atomic<uint64_t> vk_pipeline_cache_last_save_ms_{0};
+   uint32_t shader_storage_title_id_ = 0;
+ 
+   // Shader storage output stream, for preload in the next emulator runs.
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index 104bdad..c00bb02 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -49,16 +49,32 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   VkBuffer buffer() const { return buffer_; }
+ 
++  // android: a byte range the draw being recorded reads without requesting it (a vertex buffer unchanged
++  // since the previous draw). See CanHoistUpload.
++  void NoteRangeRead(uint32_t start, uint32_t length);
++
+  protected:
+   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+                                         uint32_t length_allocations) override;
+ 
+   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
++  void OnRangesRequested(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) override;
+ 
+  private:
+   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
+                      VkAccessFlags& access_mask) const;
+ 
++  // android: uploads while a render pass is open are recorded to run before that pass instead of ending it
++  // (vulkan_hoist_shared_memory_uploads), when nothing recorded in the pass so far reads the uploaded
++  // pages and the buffer is only being read. pass_read_ranges_ holds the byte ranges read in the pass with
++  // serial pass_read_serial_.
++  bool CanHoistUpload(uint32_t start, uint32_t length);
++  bool OverlapsPassReads(uint32_t start, uint32_t length);
++  void SyncPassReads();
++  uint64_t pass_read_serial_ = UINT64_MAX;
++  bool pass_read_all_ = false;
++  std::vector<std::pair<uint32_t, uint32_t>> pass_read_ranges_;
++
+   VulkanCommandProcessor& command_processor_;
+   VkPipelineStageFlags guest_shader_pipeline_stages_;
+ 
+diff --git a/include/rex/main_android.h b/include/rex/main_android.h
+new file mode 100644
+index 0000000..abee1de
+--- /dev/null
++++ b/include/rex/main_android.h
+@@ -0,0 +1,29 @@
++#pragma once
++/**
++ * android: process-wide Android setup for the runtime (Xenia's main_android, reduced to what ReXGlue uses).
++ * InitializeAndroid() must run once, early, on the main thread (before memory or threads are created):
++ * it installs the crash reporter for fatal signals and resolves the API-level-dependent functions of
++ * rex::memory (ASharedMemory) and rex::thread (pthread_getname_np).
++ *
++ * Files: the app's external files directory (SDL_GetAndroidExternalStoragePath, /sdcard/Android/data/<package>/files)
++ * is the "executable folder" and the user folder of rex::filesystem (REX_ANDROID_FILES_DIR). It holds
++ *   log.txt       stdout + stderr of this start (the previous start's is log.prev.txt)
++ *   args.txt      optional command-line arguments, whitespace-separated (e.g. --log_level=debug)
++ * plus whatever the app keeps next to its executable on other platforms.
++ */
++
++#include <signal.h>
++
++namespace rex {
++
++// The device's API level (android_get_device_api_level), cached.
++int GetAndroidApiLevel();
++
++void InitializeAndroid();
++void ShutdownAndroid();
++
++// Writes a crash report (signal, registers, mappings, frames) to stderr and logcat, once per process.
++// Called from signal handlers.
++void AndroidReportFatalSignal(int signal_number, siginfo_t* info, void* context);
++
++}  // namespace rex
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 352af67..783a76e 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -20,7 +20,9 @@
+ // before including <ucontext.h>.
+ #define _XOPEN_SOURCE 700
+ #endif
++#if !REX_PLATFORM_ANDROID  // android: bionic has no ucontext switching; fiber_posix.cpp switches stacks itself
+ #include <ucontext.h>
++#endif
+ #include <cstdint>
+ #include <vector>
+ #endif
+@@ -57,7 +59,11 @@ struct Fiber {
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_ANDROID
++  void* saved_sp_ = nullptr;  // android: stack pointer of the suspended fiber (callee-saved registers below it)
++#else
+   ucontext_t context_{};
++#endif
+   std::vector<uint8_t> stack_;
+   void (*entry_)(void*) = nullptr;
+   void* arg_ = nullptr;
+diff --git a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
+new file mode 100644
+index 0000000..f10a840
+--- /dev/null
++++ b/include/rex/ui/surface_android.h
+@@ -0,0 +1,28 @@
++#pragma once
++/**
++ * android: ANativeWindow surface for the Vulkan presenter (VK_KHR_android_surface). The window comes from SDL3
++ * (SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER); SDL owns it and recreates it across pause/resume.
++ */
++
++#include <android/native_window.h>
++
++#include <rex/ui/surface.h>
++
++namespace rex {
++namespace ui {
++
++class AndroidNativeWindowSurface final : public Surface {
++ public:
++  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {}
++  TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
++  ANativeWindow* window() const { return window_; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
++
++ private:
++  ANativeWindow* window_;
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index aa55a4a..a88a0e0 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -32,6 +32,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilCompareMask)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilReference)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilWriteMask)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetViewport)
++XE_UI_VULKAN_FUNCTION(vkCmdWriteTimestamp)
+ XE_UI_VULKAN_FUNCTION(vkCreateBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCreateBufferView)
+ XE_UI_VULKAN_FUNCTION(vkCreateCommandPool)
+@@ -44,6 +45,7 @@ XE_UI_VULKAN_FUNCTION(vkCreateGraphicsPipelines)
+ XE_UI_VULKAN_FUNCTION(vkCreateImage)
+ XE_UI_VULKAN_FUNCTION(vkCreateImageView)
+ XE_UI_VULKAN_FUNCTION(vkCreatePipelineLayout)
++XE_UI_VULKAN_FUNCTION(vkCreatePipelineCache)
+ XE_UI_VULKAN_FUNCTION(vkCreateQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkCreateRenderPass)
+ XE_UI_VULKAN_FUNCTION(vkCreateSampler)
+@@ -59,6 +61,7 @@ XE_UI_VULKAN_FUNCTION(vkDestroyFramebuffer)
+ XE_UI_VULKAN_FUNCTION(vkDestroyImage)
+ XE_UI_VULKAN_FUNCTION(vkDestroyImageView)
+ XE_UI_VULKAN_FUNCTION(vkDestroyPipeline)
++XE_UI_VULKAN_FUNCTION(vkDestroyPipelineCache)
+ XE_UI_VULKAN_FUNCTION(vkDestroyPipelineLayout)
+ XE_UI_VULKAN_FUNCTION(vkDestroyQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkDestroyRenderPass)
+@@ -72,6 +75,8 @@ XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
++XE_UI_VULKAN_FUNCTION(vkGetPipelineCacheData)
++XE_UI_VULKAN_FUNCTION(vkGetQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
+ XE_UI_VULKAN_FUNCTION(vkResetCommandPool)
+diff --git a/include/rex/ui/windowed_app.h b/include/rex/ui/windowed_app.h
+index 50638d6..efe45b9 100644
+--- a/include/rex/ui/windowed_app.h
++++ b/include/rex/ui/windowed_app.h
+@@ -24,10 +24,8 @@
+ #include <rex/platform.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+-#if REX_PLATFORM_ANDROID
+-// Multiple apps in a single library instead of separate executables.
+-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
+-#endif
++// android: one app per library (libmain.so with SDL_main, windowed_app_main_sdl.cpp), as on the desktop. Xenia's
++// Android build put several apps into one library (XE_UI_WINDOWED_APPS_IN_LIBRARY), which ReXGlue does not use.
+ 
+ namespace rex {
+ namespace ui {
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..33f2826 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -74,6 +74,11 @@ elseif(UNIX)
+         system_posix.cpp
+         threading_posix.cpp
+     )
++    if(ANDROID)
++        # android: GetAndroidApiLevel / InitializeAndroid (rex/main_android.h)
++        target_sources(rexcore PRIVATE main_android.cpp)
++        target_link_libraries(rexcore PUBLIC android log)
++    endif()
+ endif()
+ 
+ # Xenos data-format layer (stateless; headers under include/rex/graphics/).
+@@ -100,6 +105,9 @@ target_include_directories(rexcore PRIVATE
+ 
+ if(APPLE)
+     target_link_libraries(rexcore PRIVATE pthread)
++elseif(ANDROID)
++    # android: pthread and rt are part of bionic's libc
++    target_link_libraries(rexcore PRIVATE dl)
+ elseif(UNIX)
+     target_link_libraries(rexcore PRIVATE pthread rt dl)
+ endif()
+diff --git a/src/core/dynlib_posix.cpp b/src/core/dynlib_posix.cpp
+index fcfd6c9..ec5a206 100644
+--- a/src/core/dynlib_posix.cpp
++++ b/src/core/dynlib_posix.cpp
+@@ -4,6 +4,7 @@
+ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+ 
+ #include <dlfcn.h>
++#include <stdio.h>
+ 
+ namespace rex::platform {
+ 
+@@ -28,6 +29,11 @@ bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution mo
+   Close();
+   int flags = (mode == SymbolResolution::kImmediate) ? RTLD_NOW : RTLD_LAZY;
+   handle_ = dlopen(path.c_str(), flags);
++#if defined(__ANDROID__)
++  if (!handle_) {
++    fprintf(stderr, "dlopen %s: %s\n", path.c_str(), dlerror());  // android: the reason goes to log.txt
++  }
++#endif
+   return handle_ != nullptr;
+ }
+ 
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8b1c76a..b6944b7 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -31,6 +31,10 @@
+ 
+ #include <ucontext.h>
+ 
++#if REX_PLATFORM_ANDROID
++#include <rex/main_android.h>  // android: AndroidReportFatalSignal
++#endif
++
+ namespace rex::arch {
+ 
+ bool signal_handlers_installed_ = false;
+@@ -417,6 +421,14 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       return;
+     }
+   }
++#if REX_PLATFORM_ANDROID
++  // android: no handler claimed the fault, so it is a real crash. Returning would run the faulting instruction
++  // again forever (the process hangs). Log it (registers, mappings, frames) and put the previous handler back, so
++  // the instruction faults once more into it (debuggerd writes the tombstone).
++  rex::AndroidReportFatalSignal(signal_number, signal_info, signal_context);
++  sigaction(signal_number, signal_number == SIGILL ? &original_sigill_handler_ : &original_sigsegv_handler_,
++            nullptr);
++#endif
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 4fe1ca6..e0850ed 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -27,6 +27,95 @@ namespace rex::thread {
+ 
+ thread_local Fiber* Fiber::tls_current_ = nullptr;
+ 
++#if REX_PLATFORM_ANDROID
++// android: bionic has no getcontext/makecontext/swapcontext, so fibers switch stacks directly (AArch64 only).
++// rex_fiber_switch(save_sp, new_sp) pushes the AAPCS64 callee-saved registers (x19-x30, d8-d15) on the current
++// stack, stores sp in *save_sp, loads new_sp and pops the same frame. A new fiber's stack starts with such a frame
++// whose x30 is rex_fiber_start and whose x19 is the function to call, so the first switch "returns" into it.
++extern "C" void rex_fiber_switch(void** save_sp, void* new_sp);
++extern "C" void rex_fiber_start();
++asm(R"(
++  .text
++  .p2align 4
++  .globl rex_fiber_switch
++  .hidden rex_fiber_switch
++  .type rex_fiber_switch, %function
++rex_fiber_switch:
++  sub sp, sp, #160
++  stp x19, x20, [sp, #0]
++  stp x21, x22, [sp, #16]
++  stp x23, x24, [sp, #32]
++  stp x25, x26, [sp, #48]
++  stp x27, x28, [sp, #64]
++  stp x29, x30, [sp, #80]
++  stp d8, d9, [sp, #96]
++  stp d10, d11, [sp, #112]
++  stp d12, d13, [sp, #128]
++  stp d14, d15, [sp, #144]
++  mov x2, sp
++  str x2, [x0]
++  mov sp, x1
++  ldp x19, x20, [sp, #0]
++  ldp x21, x22, [sp, #16]
++  ldp x23, x24, [sp, #32]
++  ldp x25, x26, [sp, #48]
++  ldp x27, x28, [sp, #64]
++  ldp x29, x30, [sp, #80]
++  ldp d8, d9, [sp, #96]
++  ldp d10, d11, [sp, #112]
++  ldp d12, d13, [sp, #128]
++  ldp d14, d15, [sp, #144]
++  add sp, sp, #160
++  ret
++  .size rex_fiber_switch, .-rex_fiber_switch
++
++  .p2align 4
++  .globl rex_fiber_start
++  .hidden rex_fiber_start
++  .type rex_fiber_start, %function
++rex_fiber_start:
++  mov x29, #0
++  mov x30, #0
++  blr x19
++  brk #0
++  .size rex_fiber_start, .-rex_fiber_start
++)");
++
++Fiber* Fiber::ConvertCurrentThread() {
++  auto* f = new Fiber();
++  f->is_thread_fiber_ = true;
++  tls_current_ = f;
++  return f;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  auto* f = new Fiber();
++  f->entry_ = entry;
++  f->arg_ = arg;
++  f->stack_.resize(stack_size);
++  uintptr_t top = (reinterpret_cast<uintptr_t>(f->stack_.data()) + f->stack_.size()) & ~uintptr_t(15);
++  auto* frame = reinterpret_cast<uint64_t*>(top - 160);
++  for (int i = 0; i < 20; ++i) {
++    frame[i] = 0;
++  }
++  frame[0] = reinterpret_cast<uint64_t>(&Fiber::Trampoline);  // x19
++  frame[11] = reinterpret_cast<uint64_t>(&rex_fiber_start);   // x30
++  f->saved_sp_ = frame;
++  return f;
++}
++
++/*static*/ void Fiber::Trampoline() {
++  Fiber* f = tls_current_;
++  f->entry_(f->arg_);
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  tls_current_ = target;
++  rex_fiber_switch(&from->saved_sp_, target->saved_sp_);
++}
++#else
++
+ Fiber* Fiber::ConvertCurrentThread() {
+   auto* f = new Fiber();
+   if (getcontext(&f->context_) == -1) {
+@@ -67,6 +156,7 @@ void Fiber::SwitchTo(Fiber* target) {
+   tls_current_ = target;
+   swapcontext(&from->context_, &target->context_);
+ }
++#endif  // REX_PLATFORM_ANDROID
+ 
+ void Fiber::Destroy() {
+   // Thread fibers are destroyed from the owning thread itself.
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index ef5bdf4..8108329 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdlib.h>  // android: getenv
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -100,10 +101,22 @@ std::filesystem::path GetExecutablePath() {
+ }
+ 
+ std::filesystem::path GetExecutableFolder() {
++#if REX_PLATFORM_ANDROID
++  // android: the process is app_process; what other platforms keep next to the executable lives in the app's
++  // files directory (set by SDL_main, rex/main_android.h)
++  if (const char* files = std::getenv("REX_ANDROID_FILES_DIR")) {
++    return std::filesystem::path(files);
++  }
++#endif
+   return GetExecutablePath().parent_path();
+ }
+ 
+ std::filesystem::path GetUserFolder() {
++#if REX_PLATFORM_ANDROID
++  if (const char* files = std::getenv("REX_ANDROID_FILES_DIR")) {
++    return std::filesystem::path(files);
++  }
++#endif
+   // get preferred data home
+   if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {
+     return std::filesystem::path(*xdg);
+diff --git a/src/core/main_android.cpp b/src/core/main_android.cpp
+new file mode 100644
+index 0000000..e5484e4
+--- /dev/null
++++ b/src/core/main_android.cpp
+@@ -0,0 +1,348 @@
++/**
++ * android: see rex/main_android.h.
++ */
++
++#include <rex/platform.h>
++#if REX_PLATFORM_ANDROID
++
++#include <android/api-level.h>
++#include <android/log.h>
++#include <dirent.h>
++#include <dlfcn.h>
++#include <sys/syscall.h>
++#include <unwind.h>
++#include <fcntl.h>
++#include <malloc.h>
++#include <signal.h>
++#include <ucontext.h>
++#include <unistd.h>
++
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string_view>
++#include <thread>
++
++#include <rex/filesystem.h>
++#include <rex/main_android.h>
++#include <rex/memory/utils.h>
++#include <rex/thread.h>
++
++namespace rex {
++
++namespace {
++
++// Writes to stderr (the log file, see windowed_app_main_sdl.cpp) and logcat. Async-signal-safe enough for a crash
++// report: no allocation, fixed buffers.
++void Say(const char* line, size_t length) {
++  (void)!write(2, line, length);
++  __android_log_write(ANDROID_LOG_ERROR, "rexglue", line);
++}
++
++void SayF(const char* format, ...) __attribute__((format(printf, 1, 2)));
++void SayF(const char* format, ...) {
++  char line[768];
++  va_list args;
++  va_start(args, format);
++  int length = vsnprintf(line, sizeof(line), format, args);
++  va_end(args);
++  if (length < 0) {
++    return;
++  }
++  if (size_t(length) >= sizeof(line)) {
++    length = sizeof(line) - 1;
++  }
++  Say(line, size_t(length));
++}
++
++// "<file>+0x<offset> (<symbol>+0x<offset>)" for one code address.
++void PrintFrame(int index, uintptr_t pc) {
++  Dl_info info{};
++  if (pc && dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fname) {
++    const char* file = std::strrchr(info.dli_fname, '/');
++    file = file ? file + 1 : info.dli_fname;
++    const uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
++    if (info.dli_sname) {
++      SayF("  #%02d pc %016llx  %s+0x%llx (%s+0x%llx)\n", index, (unsigned long long)pc, file,
++           (unsigned long long)(pc - base), info.dli_sname,
++           (unsigned long long)(pc - reinterpret_cast<uintptr_t>(info.dli_saddr)));
++    } else {
++      SayF("  #%02d pc %016llx  %s+0x%llx\n", index, (unsigned long long)pc, file,
++           (unsigned long long)(pc - base));
++    }
++  } else {
++    SayF("  #%02d pc %016llx  ?\n", index, (unsigned long long)pc);
++  }
++}
++
++// The /proc/self/maps line holding address (guest memory, a stack, a library), or "not mapped".
++void PrintMapping(const char* what, uintptr_t address) {
++  int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
++  if (fd < 0) {
++    return;
++  }
++  char text[4096];
++  size_t have = 0;
++  bool found = false;
++  while (!found) {
++    ssize_t got = read(fd, text + have, sizeof(text) - 1 - have);
++    if (got <= 0) {
++      break;
++    }
++    have += size_t(got);
++    text[have] = 0;
++    char* line = text;
++    char* newline;
++    while ((newline = std::strchr(line, '\n'))) {
++      *newline = 0;
++      unsigned long long start = 0, end = 0;
++      if (std::sscanf(line, "%llx-%llx", &start, &end) == 2 && address >= start && address < end) {
++        SayF("  %s %llx in %s\n", what, (unsigned long long)address, line);
++        found = true;
++        break;
++      }
++      line = newline + 1;
++    }
++    have = std::strlen(line);
++    std::memmove(text, line, have);
++  }
++  close(fd);
++  if (!found) {
++    SayF("  %s %llx is not mapped\n", what, (unsigned long long)address);
++  }
++}
++
++// Bounds of the mapping holding address (from /proc/self/maps); false when it is not mapped.
++bool FindMapping(uintptr_t address, uintptr_t* start_out, uintptr_t* end_out) {
++  int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
++  if (fd < 0) {
++    return false;
++  }
++  char text[4096];
++  size_t have = 0;
++  bool found = false;
++  while (!found) {
++    ssize_t got = read(fd, text + have, sizeof(text) - 1 - have);
++    if (got <= 0) {
++      break;
++    }
++    have += size_t(got);
++    text[have] = 0;
++    char* line = text;
++    char* newline;
++    while ((newline = std::strchr(line, '\n'))) {
++      *newline = 0;
++      unsigned long long start = 0, end = 0;
++      if (std::sscanf(line, "%llx-%llx", &start, &end) == 2 && address >= start && address < end) {
++        *start_out = uintptr_t(start);
++        *end_out = uintptr_t(end);
++        found = true;
++        break;
++      }
++      line = newline + 1;
++    }
++    have = std::strlen(line);
++    std::memmove(text, line, have);
++  }
++  close(fd);
++  return found;
++}
++
++// pc, lr, then the frame records {previous x29, return address} from the interrupted registers. No unwinder:
++// libunwind authenticates signed return addresses (pointer authentication) and traps on frames of the Java
++// runtime. Records are only read inside the thread's stack mapping; return addresses lose their PAC bits.
++void WalkFrames(const ucontext_t* uc) {
++  constexpr uintptr_t kAddressMask = (uintptr_t(1) << 48) - 1;
++  PrintFrame(0, uintptr_t(uc->uc_mcontext.pc));
++  PrintFrame(1, uintptr_t(uc->uc_mcontext.regs[30]) & kAddressMask);
++  uintptr_t stack_start = 0, stack_end = 0;
++  if (!FindMapping(uintptr_t(uc->uc_mcontext.sp), &stack_start, &stack_end)) {
++    return;
++  }
++  uintptr_t fp = uintptr_t(uc->uc_mcontext.regs[29]);
++  for (int i = 2; i < 48; ++i) {
++    if (fp & 7 || fp < stack_start || fp + 16 > stack_end) {
++      break;
++    }
++    const uintptr_t next = reinterpret_cast<const uintptr_t*>(fp)[0];
++    const uintptr_t ret = reinterpret_cast<const uintptr_t*>(fp)[1] & kAddressMask;
++    if (!ret) {
++      break;
++    }
++    PrintFrame(i, ret);
++    if (next <= fp) {
++      break;
++    }
++    fp = next;
++  }
++}
++
++volatile sig_atomic_t g_reported = 0;
++struct sigaction g_previous[NSIG];
++
++const char* SignalName(int signal_number) {
++  switch (signal_number) {
++    case SIGSEGV:
++      return "SIGSEGV";
++    case SIGBUS:
++      return "SIGBUS";
++    case SIGILL:
++      return "SIGILL";
++    case SIGFPE:
++      return "SIGFPE";
++    case SIGABRT:
++      return "SIGABRT";
++    case SIGTRAP:
++      return "SIGTRAP";
++    default:
++      return "signal";
++  }
++}
++
++// Installed for every fatal signal before the runtime starts. The runtime's own handler (exception_handler_posix)
++// takes SIGSEGV/SIGILL over later and calls AndroidReportFatalSignal itself for the faults nobody claims.
++void OnFatalSignal(int signal_number, siginfo_t* info, void* context) {
++  AndroidReportFatalSignal(signal_number, info, context);
++  sigaction(signal_number, &g_previous[signal_number], nullptr);
++  if (signal_number == SIGABRT) {
++    raise(signal_number);
++  }
++  // other signals: returning runs the faulting instruction again, into the previous handler (debuggerd)
++}
++
++// Thread dump for hangs: when <files>/dump_threads appears, every thread of the process is sent SIGUSR2 in turn
++// and logs its own backtrace (unwind tables, so frames without frame pointers are walked too). The file is deleted.
++void OnDumpSignal(int, siginfo_t*, void* context) {
++  char name[32] = {};
++  char path[64];
++  std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", gettid());
++  int fd = open(path, O_RDONLY | O_CLOEXEC);
++  if (fd >= 0) {
++    ssize_t n = read(fd, name, sizeof(name) - 1);
++    if (n > 0 && name[n - 1] == '\n') {
++      name[n - 1] = 0;
++    }
++    close(fd);
++  }
++  SayF("--- thread %d \"%s\"\n", gettid(), name);
++  WalkFrames(static_cast<ucontext_t*>(context));
++}
++
++void DumpWatchThread() {
++  const char* files = std::getenv("REX_ANDROID_FILES_DIR");
++  if (!files) {
++    return;
++  }
++  char trigger[512];
++  std::snprintf(trigger, sizeof(trigger), "%s/dump_threads", files);
++  for (;;) {
++    sleep(1);
++    if (access(trigger, F_OK) != 0) {
++      continue;
++    }
++    unlink(trigger);
++    SayF("\n*** thread dump\n");
++    if (DIR* dir = opendir("/proc/self/task")) {
++      while (dirent* entry = readdir(dir)) {
++        int tid = std::atoi(entry->d_name);
++        if (tid > 0 && tid != gettid()) {
++          syscall(SYS_tgkill, getpid(), tid, SIGUSR2);
++          usleep(30000);
++        }
++      }
++      closedir(dir);
++    }
++    SayF("*** end of thread dump\n");
++  }
++}
++
++}  // namespace
++
++int GetAndroidApiLevel() {
++  static const int level = android_get_device_api_level();
++  return level;
++}
++
++void AndroidReportFatalSignal(int signal_number, siginfo_t* info, void* context) {
++  if (g_reported) {
++    return;
++  }
++  g_reported = 1;
++  auto* uc = static_cast<ucontext_t*>(context);
++  const uintptr_t pc = uc ? uintptr_t(uc->uc_mcontext.pc) : 0;
++  const uintptr_t fault = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
++  SayF("\n*** FATAL %s (%d) code %d at pc %llx, fault address %llx, thread %d\n", SignalName(signal_number),
++       signal_number, info ? info->si_code : 0, (unsigned long long)pc, (unsigned long long)fault, gettid());
++  if (!uc) {
++    return;
++  }
++  char line[640];
++  int length = 0;
++  for (int r = 0; r < 31 && length < int(sizeof(line)) - 48; ++r) {
++    length += std::snprintf(line + length, sizeof(line) - size_t(length), "%sx%d=%llx", r % 6 ? " " : "\n  ", r,
++                            (unsigned long long)uc->uc_mcontext.regs[r]);
++  }
++  length += std::snprintf(line + length, sizeof(line) - size_t(length), " sp=%llx\n",
++                          (unsigned long long)uc->uc_mcontext.sp);
++  Say(line, size_t(length));
++  PrintMapping("instruction", pc);
++  PrintMapping("address", fault);
++  PrintMapping("stack", uintptr_t(uc->uc_mcontext.sp));
++  WalkFrames(uc);
++  SayF("*** end of crash report\n");
++}
++
++void InitializeAndroid() {
++  static bool initialized = false;
++  if (initialized) {
++    return;
++  }
++  initialized = true;
++  struct sigaction handler;
++  std::memset(&handler, 0, sizeof(handler));
++  handler.sa_sigaction = OnFatalSignal;
++  handler.sa_flags = SA_SIGINFO | SA_ONSTACK;
++  sigemptyset(&handler.sa_mask);
++  for (int signal_number : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) {
++    sigaction(signal_number, &handler, &g_previous[signal_number]);
++  }
++  struct sigaction dump;
++  std::memset(&dump, 0, sizeof(dump));
++  dump.sa_sigaction = OnDumpSignal;
++  dump.sa_flags = SA_SIGINFO | SA_RESTART;
++  sigemptyset(&dump.sa_mask);
++  sigaction(SIGUSR2, &dump, nullptr);
++  std::thread(DumpWatchThread).detach();
++  // Keep freed memory cached for a while instead of returning it to the kernel at once: the GPU command
++  // processor allocates and frees per draw (in Qualcomm's driver too), and the release/refault cycle showed up
++  // as allocator and kernel time in profiles.
++  mallopt(M_DECAY_TIME, 1);
++  rex::memory::AndroidInitialize();
++  rex::thread::AndroidInitialize();
++}
++
++void ShutdownAndroid() {
++  rex::thread::AndroidShutdown();
++  rex::memory::AndroidShutdown();
++}
++
++}  // namespace rex
++
++namespace rex::filesystem {
++
++// android: game data is read from a plain directory (app-specific external storage), never through the storage
++// access framework, so content:// URIs are not supported.
++void AndroidInitialize() {}
++void AndroidShutdown() {}
++bool IsAndroidContentUri(const std::string_view source) {
++  return source.starts_with("content://");
++}
++int OpenAndroidContentFileDescriptor(const std::string_view, const char*) {
++  return -1;
++}
++
++}  // namespace rex::filesystem
++
++#endif  // REX_PLATFORM_ANDROID
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..6ac0753 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -53,8 +53,7 @@
+ 
+ #include <linux/ashmem.h>
+ 
+-// TODO(tomc): Android or maybe na. idk
+-// #include "xenia/base/main_android.h"
++#include <rex/main_android.h>  // android: GetAndroidApiLevel
+ #endif
+ 
+ namespace rex {
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..2b5f576 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -270,7 +270,7 @@ static sem_t* RexCreateAnonymousSemaphore() {
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // android: bionic has no robust mutexes
+     // Use robust mutexes so waits can recover if owner thread terminates.
+     pthread_mutexattr_t attr;
+     if (pthread_mutexattr_init(&attr) == 0) {
+@@ -290,7 +290,7 @@ class PosixConditionBase {
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+     auto predicate = [this] { return this->signaled(); };
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     int lock_result = pthread_mutex_lock(native_mutex);
+     if (lock_result == EOWNERDEAD) {
+@@ -344,7 +344,7 @@ class PosixConditionBase {
+       locks.reserve(handles.size());
+ 
+       for (size_t i = 0; i < handles.size(); ++i) {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+         int result = pthread_mutex_trylock(native_mutex);
+         if (result == 0 || result == EOWNERDEAD) {
+@@ -414,8 +414,9 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
++        // android: microseconds, not milliseconds: under 1 ms left truncated to a 0 ms sleep, and the loop spun
++        auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(end_time - now);
++        auto sleep_time = std::min<std::chrono::microseconds>(remaining, std::chrono::milliseconds(1));
+         std::this_thread::sleep_for(sleep_time);
+       }
+     }
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..6c357a6 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -10,7 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <condition_variable>
+ #include <forward_list>
++#include <mutex>
+ 
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+@@ -66,10 +68,22 @@ class TimerQueue {
+ 
+     while (!stop_token.stop_requested()) {
+       {
++        // android: sleep on a condition variable until the next timer is due or QueueTimer adds one, then
++        // only poll the ring buffer. The spin strategy's wait yielded in a loop (and asked
++        // hardware_concurrency(), which reads a /sys file on Android, every time): a core spent on waiting.
++        {
++          const clock::time_point deadline =
++              wait_queue_.empty() ? clock::now() + std::chrono::milliseconds(100)
++                                  : wait_queue_.front()->due_;
++          std::unique_lock<std::mutex> lock(wake_mutex_);
++          wake_cv_.wait_until(lock, deadline, [&] {
++            return wake_pending_ || stop_token.stop_requested();
++          });
++          wake_pending_ = false;
++        }
+         // Consume new wait items and add them to sorted wait queue
+-        dp::sequence_t available = claim_strategy_.wait_until_published(
+-            next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++        dp::sequence_t available =
++            claim_strategy_.wait_until_published(next_sequence, next_sequence - 1, clock::now());
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
+@@ -132,6 +146,12 @@ class TimerQueue {
+     auto sequence = claim_strategy_.claim_one();
+     buffer_[sequence] = std::move(wait_item);
+     claim_strategy_.publish(sequence);
++    {
++      // android: wake the dispatch thread (see TimerThreadMain)
++      std::lock_guard<std::mutex> lock(wake_mutex_);
++      wake_pending_ = true;
++    }
++    wake_cv_.notify_one();
+ 
+     return wait_item_weak;
+   }
+@@ -149,6 +169,10 @@ class TimerQueue {
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+   std::forward_list<std::shared_ptr<WaitItem>> wait_queue_;
++  // android: the dispatch thread's sleep (TimerThreadMain) and its wake-up from QueueTimer
++  std::mutex wake_mutex_;
++  std::condition_variable wake_cv_;
++  bool wake_pending_ = false;
+   std::jthread dispatch_thread_;
+ };
+ 
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 1774f97..910c0e3 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -25,6 +25,12 @@
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/math.h>
+ #include <rex/string/buffer.h>
++#include <rex/cvar.h>
++
++// android: see SpirvShaderTranslator::var_main_registers_individual_
++REXCVAR_DEFINE_BOOL(spirv_registers_as_variables, true, "GPU",
++                    "Translate shader registers to separate SPIR-V variables when a shader never addresses "
++                    "them dynamically (faster on mobile GPU compilers, which spill local arrays)");
+ 
+ namespace rex::graphics {
+ 
+@@ -137,6 +143,7 @@ void SpirvShaderTranslator::Reset() {
+ 
+   main_interface_.clear();
+   var_main_registers_ = spv::NoResult;
++  var_main_registers_individual_.clear();
+   var_main_memexport_address_ = spv::NoResult;
+   for (size_t memexport_eM_index = 0; memexport_eM_index < rex::countof(var_main_memexport_data_);
+        ++memexport_eM_index) {
+@@ -509,10 +516,21 @@ void SpirvShaderTranslator::StartTranslation() {
+         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float3_,
+                                  "xe_var_tfetch_gradients_v", const_float3_0_);
+     if (register_count()) {
+-      spv::Id type_register_array =
+-          builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
+-      var_main_registers_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
+-                                                     type_register_array, "xe_var_registers");
++      if (REXCVAR_GET(spirv_registers_as_variables) &&
++          !current_shader().uses_register_dynamic_addressing()) {
++        // android: one variable per register (var_main_registers_individual_)
++        var_main_registers_individual_.reserve(register_count());
++        for (uint32_t i = 0; i < register_count(); ++i) {
++          var_main_registers_individual_.push_back(builder_->createVariable(
++              spv::NoPrecision, spv::StorageClassFunction, type_float4_,
++              fmt::format("xe_var_r{}", i).c_str()));
++        }
++      } else {
++        spv::Id type_register_array =
++            builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
++        var_main_registers_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
++                                                       type_register_array, "xe_var_registers");
++      }
+     }
+     if (IsSpirvRectangleListVertexLoopEnabled()) {
+       Modification shader_modification = GetSpirvShaderModification();
+@@ -793,11 +811,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+         builder_->createStore(const_float3_0_, var_main_tfetch_gradients_h_);
+         builder_->createStore(const_float3_0_, var_main_tfetch_gradients_v_);
+         for (uint32_t i = 0; i < register_count(); ++i) {
+-          id_vector_temp_.clear();
+-          id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+-          builder_->createStore(const_float4_0_,
+-                                builder_->createAccessChain(spv::StorageClassFunction,
+-                                                            var_main_registers_, id_vector_temp_));
++          builder_->createStore(const_float4_0_, RegisterPointer(i));
+         }
+         uint32_t iteration_interpolators_remaining = GetModificationInterpolatorMask();
+         while (rex::bit_scan_forward(iteration_interpolators_remaining, &interpolator_index)) {
+@@ -927,12 +941,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+               rectangle_vertex_index_min, rectangle_vertex_index_max);
+           spv::Id rectangle_vertex_index_float =
+               builder_->createUnaryOp(spv::OpConvertUToF, type_float_, rectangle_vertex_index);
+-          id_vector_temp_.clear();
+-          id_vector_temp_.push_back(const_int_0_);
+-          id_vector_temp_.push_back(const_int_0_);
+-          builder_->createStore(rectangle_vertex_index_float,
+-                                builder_->createAccessChain(spv::StorageClassFunction,
+-                                                            var_main_registers_, id_vector_temp_));
++          builder_->createStore(rectangle_vertex_index_float, RegisterPointer(0, 0));
+         }
+ 
+         if (has_main_switch) {
+@@ -1795,11 +1804,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
+   // Zero general-purpose registers to prevent crashes when the game
+   // references them after only initializing them conditionally.
+   for (uint32_t i = 0; i < register_count(); ++i) {
+-    id_vector_temp_.clear();
+-    id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+-    builder_->createStore(
+-        const_float4_0_, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                                     id_vector_temp_));
++    builder_->createStore(const_float4_0_, RegisterPointer(i));
+   }
+ 
+   if (!IsSpirvComputeShader()) {
+@@ -1860,12 +1865,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
+   if (register_count()) {
+     auto store_register_component = [this](uint32_t register_index, uint32_t component,
+                                            spv::Id value) {
+-      id_vector_temp_.clear();
+-      id_vector_temp_.push_back(builder_->makeIntConstant(int(register_index)));
+-      id_vector_temp_.push_back(builder_->makeIntConstant(int(component)));
+-      builder_->createStore(
+-          value, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                             id_vector_temp_));
++      builder_->createStore(value, RegisterPointer(register_index, component));
+     };
+     if (IsSpirvTessEvalShader()) {
+       auto load_tess_coord_component = [this](uint32_t component) {
+@@ -3171,14 +3171,11 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+     if (i == param_gen_interpolator) {
+       continue;
+     }
+-    id_vector_temp_.clear();
+-    id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+     builder_->createStore(
+         (i < xenos::kMaxInterpolators && (interpolator_mask & (UINT32_C(1) << i)))
+             ? builder_->createLoad(input_output_interpolators_[i], spv::NoPrecision)
+             : const_float4_0_,
+-        builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                    id_vector_temp_));
++        RegisterPointer(i));
+   }
+ 
+   // Pixel parameters.
+@@ -3293,11 +3290,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+     id_vector_temp_.push_back(param_gen_z);
+     id_vector_temp_.push_back(param_gen_w);
+     spv::Id param_gen = builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+-    id_vector_temp_.clear();
+-    id_vector_temp_.push_back(builder_->makeIntConstant(int(param_gen_interpolator)));
+-    builder_->createStore(
+-        param_gen, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+-                                               id_vector_temp_));
++    builder_->createStore(param_gen, RegisterPointer(param_gen_interpolator));
+   }
+ 
+   if (!edram_fragment_shader_interlock_) {
+@@ -3496,6 +3489,28 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
+   return index;
+ }
+ 
++spv::Id SpirvShaderTranslator::RegisterPointer(uint32_t register_index, uint32_t component) {
++  // android: see var_main_registers_individual_
++  std::vector<spv::Id> indices;
++  spv::Id base;
++  if (!var_main_registers_individual_.empty()) {
++    assert_true(register_index < var_main_registers_individual_.size());
++    base = var_main_registers_individual_[std::min<size_t>(register_index,
++                                                           var_main_registers_individual_.size() - 1)];
++    if (component == UINT32_MAX) {
++      return base;
++    }
++  } else {
++    assert_true(var_main_registers_ != spv::NoResult);
++    base = var_main_registers_;
++    indices.push_back(builder_->makeIntConstant(int(register_index)));
++  }
++  if (component != UINT32_MAX) {
++    indices.push_back(builder_->makeIntConstant(int(component)));
++  }
++  return builder_->createAccessChain(spv::StorageClassFunction, base, indices);
++}
++
+ spv::Id SpirvShaderTranslator::LoadOperandStorage(const InstructionOperand& operand) {
+   spv::Id index =
+       GetStorageAddressingIndex(operand.storage_addressing_mode, operand.storage_index,
+@@ -3504,6 +3519,11 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(const InstructionOperand& oper
+   spv::Id vec4_pointer = spv::NoResult;
+   switch (operand.storage_source) {
+     case InstructionStorageSource::kRegister:
++      if (!var_main_registers_individual_.empty() &&
++          operand.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
++        vec4_pointer = RegisterPointer(operand.storage_index);  // android
++        break;
++      }
+       assert_true(var_main_registers_ != spv::NoResult);
+       id_vector_temp_util_.clear();
+       // Array element.
+@@ -3619,6 +3639,11 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
+     case InstructionStorageTarget::kNone:
+       break;
+     case InstructionStorageTarget::kRegister: {
++      if (!var_main_registers_individual_.empty() &&
++          result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
++        target_pointer = RegisterPointer(result.storage_index);  // android
++        break;
++      }
+       assert_true(var_main_registers_ != spv::NoResult);
+       // Must call GetStorageAddressingIndex first because of
+       // id_vector_temp_util_ usage in it.
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..09d7b5d 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -461,11 +461,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
+                     uint32_t(upload_ranges_.size()));
+ 
+-  if (upload_ranges_.empty()) {
+-    return true;
+-  }
+-
+-  return UploadRanges(upload_ranges_);
++  const bool uploaded = upload_ranges_.empty() || UploadRanges(upload_ranges_);
++  OnRangesRequested(merged_ranges);
++  return uploaded;
+ }
+ 
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..056824a 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -10,6 +10,10 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
++#if !defined(_WIN32)
++#include <dlfcn.h>
++#endif
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+@@ -64,6 +68,18 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DECLARE(bool, vulkan_gpu_profile);  // deferred_command_buffer.cpp
++
++REXCVAR_DEFINE_BOOL(vulkan_hoist_texture_loads, true, "GPU/Vulkan",
++                    "Record a draw's texture loads before the open render pass instead of ending it "
++                    "(android: every render pass split costs a tile load and store on mobile GPUs)");
++
++REXCVAR_DEFINE_BOOL(vulkan_reuse_texture_descriptors, true, "GPU/Vulkan",
++                    "Keep a draw's texture/sampler descriptor set when the bindings equal the previous "
++                    "draw's instead of writing a new one (android: descriptor writes are costly on mobile "
++                    "drivers)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
+@@ -2855,6 +2871,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+           render_pass_begin_info.renderArea.extent.height = guest_output_height;
+           render_pass_begin_info.clearValueCount = 0;
+           render_pass_begin_info.pClearValues = nullptr;
++          deferred_command_buffer_.SetNextPassKind(DeferredCommandBuffer::kPassPresent);
+           deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                         VK_SUBPASS_CONTENTS_INLINE);
+ 
+@@ -3235,6 +3252,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
+     rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
+     rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
++    deferred_command_buffer_.SetNextPassKind(DeferredCommandBuffer::kPassRenderTargetCache);
+     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+   } else {
+     VkRenderPassBeginInfo render_pass_begin_info;
+@@ -3247,17 +3265,84 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
+     render_pass_begin_info.clearValueCount = 0;
+     render_pass_begin_info.pClearValues = nullptr;
++    deferred_command_buffer_.SetNextPassKind(DeferredCommandBuffer::kPassRenderTargetCache);
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
+   in_render_pass_ = true;
+ }
+ 
++// android: vulkan_gpu_profile also counts where render passes are ended from (three return addresses, as
++// library offsets for llvm-symbolizer) and logs the most frequent call sites every 3 seconds.
++static void ProfileRenderPassBreak(void* ra0, void* ra1, void* ra2) {
++  struct Site {
++    uintptr_t ra[3];
++    uint32_t count;
++  };
++  static std::vector<Site> sites;
++  static uint64_t window_start_ns = 0;
++  static uint32_t total = 0;
++  const uintptr_t ra[3] = {uintptr_t(ra0), uintptr_t(ra1), uintptr_t(ra2)};
++  bool found = false;
++  for (Site& site : sites) {
++    if (site.ra[0] == ra[0] && site.ra[1] == ra[1] && site.ra[2] == ra[2]) {
++      ++site.count;
++      found = true;
++      break;
++    }
++  }
++  if (!found && sites.size() < 256) {
++    sites.push_back({{ra[0], ra[1], ra[2]}, 1});
++  }
++  ++total;
++  const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                       std::chrono::steady_clock::now().time_since_epoch())
++                                       .count());
++  if (!window_start_ns) {
++    window_start_ns = now_ns;
++  }
++  if (now_ns - window_start_ns < 3000000000ull) {
++    return;
++  }
++  std::sort(sites.begin(), sites.end(),
++            [](const Site& a, const Site& b) { return a.count > b.count; });
++  REXGPU_INFO("gpuprof: {} render pass ends in 3 s, by call site:", total);
++  uintptr_t base = 0;
++#if !defined(_WIN32)
++  Dl_info info;
++  if (dladdr(reinterpret_cast<void*>(&ProfileRenderPassBreak), &info)) {
++    base = uintptr_t(info.dli_fbase);
++  }
++#endif
++  for (size_t i = 0; i < std::min<size_t>(sites.size(), 10); ++i) {
++    REXGPU_INFO("gpuprof:   {:6} 0x{:x} 0x{:x} 0x{:x}", sites[i].count, sites[i].ra[0] - base,
++                sites[i].ra[1] - base, sites[i].ra[2] - base);
++  }
++  sites.clear();
++  total = 0;
++  window_start_ns = now_ns;
++}
++
++void VulkanCommandProcessor::AbortHoistRegion() {
++  if (!hoist_region_open_) {
++    return;
++  }
++  deferred_command_buffer_.TakeHoistRegion(hoist_region_start_, hoist_region_commands_);
++  hoist_region_open_ = false;
++  EndRenderPass();
++  deferred_command_buffer_.AppendRaw(hoist_region_commands_);
++  hoist_region_commands_.clear();
++}
++
+ void VulkanCommandProcessor::EndRenderPass() {
+   assert_true(submission_open_);
+-  if (!in_render_pass_) {
++  if (!in_render_pass_ || hoist_region_open_) {
+     return;
+   }
++  if (REXCVAR_GET(vulkan_gpu_profile)) {
++    ProfileRenderPassBreak(__builtin_return_address(0), __builtin_return_address(1),
++                           __builtin_return_address(2));
++  }
+   if (current_render_pass_ == VK_NULL_HANDLE) {
+     deferred_command_buffer_.CmdVkEndRendering();
+   } else {
+@@ -3835,7 +3920,30 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++  // android: texture loads and the transitions to sampling run before the open render pass instead of
++  // ending it (vulkan_hoist_texture_loads), unless barriers recorded for the pass are still pending or the
++  // pass has memexport draws (the scratch buffer and guest memory written in the pass). Guest memory
++  // uploads in the region that earlier draws of the pass read abort the region
++  // (VulkanSharedMemory::UploadRanges). A texture sampled earlier in the pass and reloaded now (the CPU
++  // rewrote it in between) is seen with the new contents by those earlier draws too.
++  if (REXCVAR_GET(vulkan_hoist_texture_loads) && in_render_pass_ &&
++      deferred_command_buffer_.IsRenderPassOpen() &&
++      memexport_pass_serial_ != deferred_command_buffer_.pass_serial()) {
++    SplitPendingBarrier();
++    if (pending_barriers_.empty()) {
++      hoist_region_start_ = deferred_command_buffer_.BeginHoistRegion();
++      hoist_region_open_ = true;
++    }
++  }
+   texture_cache_->RequestTextures(used_texture_mask);
++  if (hoist_region_open_) {
++    // The transitions to sampling pushed by RequestTextures go into the region too, and the guest memory
++    // buffer goes back to reading there (after uploads in the region) rather than in the draw.
++    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
++    SubmitBarriers(false);
++    deferred_command_buffer_.EndHoistRegion();
++    hoist_region_open_ = false;
++  }
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
+@@ -3987,6 +4095,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       uint32_t vfetch_index = i * 32 + j;
+       uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
+       if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
++        // android: still read by this draw (VulkanSharedMemory::CanHoistUpload).
++        const VertexBufferState& state = vertex_buffer_states_[vfetch_index];
++        shared_memory_->NoteRangeRead(state.address << 2, state.size << 2);
+         continue;
+       }
+       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+@@ -4012,6 +4123,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+       if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
++        // android: still read by this draw (VulkanSharedMemory::CanHoistUpload).
++        shared_memory_->NoteRangeRead(vfetch_constant.address << 2, vfetch_constant.size << 2);
+         continue;
+       }
+       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+@@ -4114,6 +4227,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+       render_target_cache_->last_update_render_pass(),
+       render_target_cache_->last_update_framebuffer());
++  if (memexport_writes_possible) {
++    memexport_pass_serial_ = deferred_command_buffer_.pass_serial();
++  }
+ 
+   // Draw.
+   if (primitive_processing_result.index_buffer_type ==
+@@ -6559,32 +6675,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     sampler_count_pixel = 0;
+     texture_count_pixel = 0;
+   }
+-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
+-  current_graphics_descriptor_set_values_up_to_date_ &=
+-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+-
+-  // Make sure new descriptor sets are bound to the command buffer.
+-
+-  current_graphics_descriptor_sets_bound_up_to_date_ &=
+-      current_graphics_descriptor_set_values_up_to_date_;
+-
+-  // Fill the texture and sampler write image infos.
+-
+-  bool write_vertex_textures =
+-      (texture_count_vertex || sampler_count_vertex) &&
+-      !(current_graphics_descriptor_set_values_up_to_date_ &
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+-  bool write_pixel_textures =
+-      (texture_count_pixel || sampler_count_pixel) &&
+-      !(current_graphics_descriptor_set_values_up_to_date_ &
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
++  // android: texture and sampler bindings are reused when unchanged (the TODO that stood here): the infos are
++  // always gathered, compared with the ones last written for the stage, and the stage's descriptor set is only
++  // invalidated when they differ (vulkan_reuse_texture_descriptors).
+   descriptor_write_image_info_.clear();
+-  descriptor_write_image_info_.reserve(
+-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
+-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
++  descriptor_write_image_info_.reserve(texture_count_vertex + sampler_count_vertex +
++                                       texture_count_pixel + sampler_count_pixel);
+   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
+-  if (write_vertex_textures && texture_count_vertex) {
++  if (texture_count_vertex) {
+     for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
+       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+@@ -6596,7 +6694,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
+-  if (write_vertex_textures && sampler_count_vertex) {
++  if (sampler_count_vertex) {
+     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+          current_samplers_vertex_) {
+       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+@@ -6604,7 +6702,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+   size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
+-  if (write_pixel_textures && texture_count_pixel) {
++  if (texture_count_pixel) {
+     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
+       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+@@ -6616,13 +6714,64 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
+-  if (write_pixel_textures && sampler_count_pixel) {
++  if (sampler_count_pixel) {
+     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+          current_samplers_pixel_) {
+       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+       descriptor_image_info.sampler = sampler_pair.second;
+     }
+   }
++  size_t image_info_end = descriptor_write_image_info_.size();
++
++  // android: keep a stage's texture descriptor set when its layout and every texture/sampler info equal the
++  // last ones written for it.
++  const bool reuse_texture_descriptors = REXCVAR_GET(vulkan_reuse_texture_descriptors);
++  auto same_texture_bindings = [&](uint32_t stage, size_t begin, size_t end,
++                                   VkDescriptorSetLayout layout) -> bool {
++    if (!reuse_texture_descriptors || last_texture_set_layout_[stage] != layout) {
++      return false;
++    }
++    const std::vector<VkDescriptorImageInfo>& last = last_texture_image_info_[stage];
++    if (last.size() != end - begin) {
++      return false;
++    }
++    for (size_t i = 0; i < last.size(); ++i) {
++      const VkDescriptorImageInfo& now = descriptor_write_image_info_[begin + i];
++      if (now.sampler != last[i].sampler || now.imageView != last[i].imageView ||
++          now.imageLayout != last[i].imageLayout) {
++        return false;
++      }
++    }
++    return true;
++  };
++  const VkDescriptorSetLayout texture_layout_vertex =
++      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref();
++  const VkDescriptorSetLayout texture_layout_pixel =
++      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
++  if (!same_texture_bindings(0, vertex_texture_image_info_offset, pixel_texture_image_info_offset,
++                             texture_layout_vertex)) {
++    current_graphics_descriptor_set_values_up_to_date_ &=
++        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
++  }
++  if (!same_texture_bindings(1, pixel_texture_image_info_offset, image_info_end,
++                             texture_layout_pixel)) {
++    current_graphics_descriptor_set_values_up_to_date_ &=
++        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
++  }
++
++  // Make sure new descriptor sets are bound to the command buffer.
++
++  current_graphics_descriptor_sets_bound_up_to_date_ &=
++      current_graphics_descriptor_set_values_up_to_date_;
++
++  bool write_vertex_textures =
++      (texture_count_vertex || sampler_count_vertex) &&
++      !(current_graphics_descriptor_set_values_up_to_date_ &
++        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
++  bool write_pixel_textures =
++      (texture_count_pixel || sampler_count_pixel) &&
++      !(current_graphics_descriptor_set_values_up_to_date_ &
++        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+ 
+   // Write the new descriptor sets.
+ 
+@@ -6714,6 +6863,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   // Only make valid if all descriptor sets have been allocated and written
+   // successfully.
+   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
++  // android: remember what the texture sets now hold (see same_texture_bindings above)
++  if (write_vertex_textures) {
++    last_texture_image_info_[0].assign(
++        descriptor_write_image_info_.begin() + vertex_texture_image_info_offset,
++        descriptor_write_image_info_.begin() + pixel_texture_image_info_offset);
++    last_texture_set_layout_[0] = texture_layout_vertex;
++  }
++  if (write_pixel_textures) {
++    last_texture_image_info_[1].assign(descriptor_write_image_info_.begin() + pixel_texture_image_info_offset,
++                                       descriptor_write_image_info_.begin() + image_info_end);
++    last_texture_set_layout_[1] = texture_layout_pixel;
++  }
+ 
+   // Bind the new descriptor sets.
+   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033..323b87e 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -9,19 +9,37 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/vulkan/command_processor.h>
+ #include <rex/graphics/vulkan/deferred_command_buffer.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ 
++REXCVAR_DEFINE_BOOL(vulkan_gpu_profile, false, "GPU/Vulkan",
++                    "Time every render pass and dispatch on the GPU with timestamp queries and log a "
++                    "summary every 3 seconds (gpuprof: lines)");
++
++REXCVAR_DEFINE_BOOL(vulkan_trim_render_area, true, "GPU/Vulkan",
++                    "Shrink each render pass's render area to the bounds of its draws and clears instead of "
++                    "the whole EDRAM-sized render target (android: tiling GPUs load and store the whole "
++                    "render area on every pass)");
++
+ namespace rex::graphics::vulkan {
+ 
++GpuProfileCounters& gpu_profile_counters() {
++  static GpuProfileCounters counters;
++  return counters;
++}
++
+ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
+                                              size_t initial_size)
+     : command_processor_(command_processor) {
+@@ -30,6 +48,67 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
+ 
+ void DeferredCommandBuffer::Reset() {
+   command_stream_.clear();
++  trim_render_area_ = REXCVAR_GET(vulkan_trim_render_area);
++  profile_enabled_ = REXCVAR_GET(vulkan_gpu_profile);
++  hoist_stream_.clear();
++  hoist_blocks_.clear();
++  write_stream_ = &command_stream_;
++  open_pass_header_offset_ = kNoPass;
++  pass_area_offset_ = kNoPass;
++  pass_clear_rects_.clear();
++  scissor_valid_ = false;
++}
++
++void DeferredCommandBuffer::BeginPassArea(uint8_t* render_area_ptr) {
++  if (!trim_render_area_) {
++    return;
++  }
++  pass_area_offset_ =
++      size_t(render_area_ptr - reinterpret_cast<uint8_t*>(command_stream_.data()));
++  pass_area_full_ = false;
++  pass_area_empty_ = true;
++  pass_clear_rects_.clear();
++}
++
++void DeferredCommandBuffer::EndPassArea() {
++  if (pass_area_offset_ == kNoPass) {
++    return;
++  }
++  uint8_t* base = reinterpret_cast<uint8_t*>(command_stream_.data());
++  for (const PassClearRects& clear : pass_clear_rects_) {
++    const VkClearRect* rects = reinterpret_cast<const VkClearRect*>(base + clear.offset_bytes);
++    for (uint32_t i = 0; i < clear.count; ++i) {
++      AddRectToPassArea(rects[i].rect);
++    }
++  }
++  pass_clear_rects_.clear();
++  VkRect2D& area = *reinterpret_cast<VkRect2D*>(base + pass_area_offset_);
++  pass_area_offset_ = kNoPass;
++  if (pass_area_full_) {
++    return;
++  }
++  if (pass_area_empty_) {
++    // Nothing rasterized (a pass for barriers or queries only): nothing to load or store.
++    area.extent.width = std::min(area.extent.width, 1u);
++    area.extent.height = std::min(area.extent.height, 1u);
++    return;
++  }
++  // Out to 32-pixel steps (bin alignment) and into the original area.
++  const int64_t ax0 = area.offset.x, ay0 = area.offset.y;
++  const int64_t ax1 = ax0 + area.extent.width, ay1 = ay0 + area.extent.height;
++  int64_t x0 = std::max(ax0, pass_x0_ & ~int64_t(31));
++  int64_t y0 = std::max(ay0, pass_y0_ & ~int64_t(31));
++  int64_t x1 = std::min(ax1, (pass_x1_ + 31) & ~int64_t(31));
++  int64_t y1 = std::min(ay1, (pass_y1_ + 31) & ~int64_t(31));
++  if (x1 <= x0 || y1 <= y0) {
++    area.extent.width = std::min(area.extent.width, 1u);
++    area.extent.height = std::min(area.extent.height, 1u);
++    return;
++  }
++  area.offset.x = int32_t(x0);
++  area.offset.y = int32_t(y0);
++  area.extent.width = uint32_t(x1 - x0);
++  area.extent.height = uint32_t(y1 - y0);
+ }
+ 
+ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+@@ -37,11 +116,66 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  // android: vulkan_gpu_profile (see ProfileBegin).
++  ProfilePool* profile = profile_enabled_ ? ProfileBegin(command_buffer) : nullptr;
++  hoist_block_index_ = 0;
++  ExecuteStream(command_buffer, command_stream_.data(), command_stream_.size(), profile, true);
++  if (profile) {
++    ProfileStampWrite(command_buffer, profile, kSegOther);
++  }
++}
++
++void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
++                                          size_t stream_remaining, ProfilePool* profile,
++                                          bool is_main) {
+   const ui::vulkan::VulkanDevice::Functions& dfn =
+       command_processor_.GetVulkanDevice()->functions();
+-  const uintmax_t* stream = command_stream_.data();
+-  size_t stream_remaining = command_stream_.size();
++  uint8_t& profile_pass_kind = profile_pass_kind_;
++  uint32_t& profile_pass_draws = profile_pass_draws_;
++  uint32_t& profile_pass_width = profile_pass_width_;
++  uint32_t& profile_pass_height = profile_pass_height_;
+   while (stream_remaining) {
++    // android: commands hoisted to before this render pass (BeginHoist).
++    const bool hoisted_here =
++        is_main && hoist_block_index_ < hoist_blocks_.size() &&
++        hoist_blocks_[hoist_block_index_].anchor == size_t(stream - command_stream_.data());
++    if (hoisted_here && profile) {
++      ProfileStampWrite(command_buffer, profile, kSegOther);
++    }
++    while (is_main && hoist_block_index_ < hoist_blocks_.size() &&
++           hoist_blocks_[hoist_block_index_].anchor == size_t(stream - command_stream_.data())) {
++      const HoistBlock& block = hoist_blocks_[hoist_block_index_++];
++      if (block.buffer == VK_NULL_HANDLE) {
++        // A hoisted region (BeginHoistRegion): carries its own barriers.
++        ExecuteStream(command_buffer, hoist_stream_.data() + block.begin, block.end - block.begin,
++                      nullptr, false);
++        continue;
++      }
++      VkBufferMemoryBarrier barrier = {};
++      barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++      // After earlier reads and any GPU write recorded before the pass (resolves, memexport) whose own
++      // barrier may still be pending.
++      barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++      barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      barrier.buffer = block.buffer;
++      barrier.offset = 0;
++      barrier.size = VK_WHOLE_SIZE;
++      dfn.vkCmdPipelineBarrier(command_buffer, block.read_stage_mask | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier, 0,
++                               nullptr);
++      ExecuteStream(command_buffer, hoist_stream_.data() + block.begin, block.end - block.begin,
++                    nullptr, false);
++      // Make the copies visible to everything that reads the buffer after them, including the pass.
++      barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++      barrier.dstAccessMask = block.read_access_mask;
++      dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               block.read_stage_mask, 0, 0, nullptr, 1, &barrier, 0, nullptr);
++    }
++    if (hoisted_here && profile) {
++      ProfileStampWrite(command_buffer, profile, kSegHoisted);
++    }
+     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+     stream += kCommandHeaderSizeElements;
+     stream_remaining -= kCommandHeaderSizeElements;
+@@ -56,6 +190,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+         render_pass_begin_info.renderPass = args.render_pass;
+         render_pass_begin_info.framebuffer = args.framebuffer;
+         render_pass_begin_info.renderArea = args.render_area;
++        if (profile) {
++          ProfileStampWrite(command_buffer, profile, kSegOther);
++          profile_pass_kind = uint8_t(args.profile_kind);
++          profile_pass_draws = 0;
++          profile_pass_width = args.render_area.extent.width;
++          profile_pass_height = args.render_area.extent.height;
++        }
+         render_pass_begin_info.clearValueCount = args.clear_value_count;
+         if (render_pass_begin_info.clearValueCount) {
+           offset_bytes = rex::align(offset_bytes, alignof(VkClearValue));
+@@ -165,17 +306,26 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kVkDispatch: {
+         auto& args = *reinterpret_cast<const ArgsVkDispatch*>(stream);
++        if (profile) {
++          ProfileStampWrite(command_buffer, profile, kSegOther);
++        }
+         dfn.vkCmdDispatch(command_buffer, args.group_count_x, args.group_count_y,
+                           args.group_count_z);
++        if (profile) {
++          ProfileStampWrite(command_buffer, profile, kSegDispatch, 0, args.group_count_x,
++                            args.group_count_y);
++        }
+       } break;
+ 
+       case Command::kVkDraw: {
++        ++profile_pass_draws;
+         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
+         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
+                       args.first_instance);
+       } break;
+ 
+       case Command::kVkDrawIndexed: {
++        ++profile_pass_draws;
+         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
+         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
+                              args.first_index, args.vertex_offset, args.first_instance);
+@@ -188,6 +338,10 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kVkEndRenderPass:
+         dfn.vkCmdEndRenderPass(command_buffer);
++        if (profile) {
++          ProfileStampWrite(command_buffer, profile, SegmentKind(profile_pass_kind),
++                            profile_pass_draws, profile_pass_width, profile_pass_height);
++        }
+         break;
+ 
+       case Command::kVkBeginRendering: {
+@@ -216,6 +370,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+         rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+         rendering_info.flags = args.flags;
+         rendering_info.renderArea = args.render_area;
++        if (profile) {
++          ProfileStampWrite(command_buffer, profile, kSegOther);
++          profile_pass_kind = uint8_t(args.profile_kind);
++          profile_pass_draws = 0;
++          profile_pass_width = args.render_area.extent.width;
++          profile_pass_height = args.render_area.extent.height;
++        }
+         rendering_info.layerCount = args.layer_count;
+         rendering_info.viewMask = args.view_mask;
+         rendering_info.colorAttachmentCount = args.color_attachment_count;
+@@ -227,6 +388,10 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+ 
+       case Command::kVkEndRendering:
+         dfn.vkCmdEndRendering(command_buffer);
++        if (profile) {
++          ProfileStampWrite(command_buffer, profile, SegmentKind(profile_pass_kind),
++                            profile_pass_draws, profile_pass_width, profile_pass_height);
++        }
+         break;
+ 
+       case Command::kVkPipelineBarrier: {
+@@ -324,6 +489,206 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+   }
+ }
+ 
++void DeferredCommandBuffer::BeginHoist(VkBuffer buffer, VkPipelineStageFlags read_stage_mask,
++                                       VkAccessFlags read_access_mask) {
++  assert_true(open_pass_header_offset_ != kNoPass);
++  assert_true(write_stream_ == &command_stream_);
++  write_stream_ = &hoist_stream_;
++  if (hoist_blocks_.empty() || hoist_blocks_.back().anchor != open_pass_header_offset_ ||
++      hoist_blocks_.back().buffer != buffer) {
++    hoist_blocks_.push_back({open_pass_header_offset_, hoist_stream_.size(), hoist_stream_.size(),
++                             buffer, read_stage_mask, read_access_mask});
++  }
++}
++
++void DeferredCommandBuffer::EndHoist() {
++  hoist_blocks_.back().end = hoist_stream_.size();
++  write_stream_ = &command_stream_;
++}
++
++size_t DeferredCommandBuffer::BeginHoistRegion() {
++  assert_true(open_pass_header_offset_ != kNoPass);
++  assert_true(write_stream_ == &command_stream_);
++  // A block of its own (no buffer: no barriers around it from Execute).
++  hoist_blocks_.push_back({open_pass_header_offset_, hoist_stream_.size(), hoist_stream_.size(),
++                           VK_NULL_HANDLE, 0, 0});
++  write_stream_ = &hoist_stream_;
++  const size_t region_start = hoist_stream_.size();
++  // Order the region after everything hoisted before it for this pass (copies whose barrier Execute only
++  // writes at the end of their block).
++  VkMemoryBarrier barrier = {};
++  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++  barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
++                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++  CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
++                       &barrier, 0, nullptr, 0, nullptr);
++  hoist_region_after_barrier_ = hoist_stream_.size();
++  return region_start;
++}
++
++void DeferredCommandBuffer::EndHoistRegion() {
++  HoistBlock& block = hoist_blocks_.back();
++  if (hoist_stream_.size() == hoist_region_after_barrier_) {
++    // Nothing recorded besides the barrier (the usual case: no texture to load): drop the region.
++    hoist_stream_.resize(block.begin);
++    hoist_blocks_.pop_back();
++  } else {
++    block.end = hoist_stream_.size();
++  }
++  write_stream_ = &command_stream_;
++}
++
++void DeferredCommandBuffer::TakeHoistRegion(size_t region_start, std::vector<uintmax_t>& commands_out) {
++  assert_true(write_stream_ == &hoist_stream_);
++  commands_out.assign(hoist_stream_.begin() + region_start, hoist_stream_.end());
++  hoist_stream_.resize(region_start);
++  HoistBlock& block = hoist_blocks_.back();
++  block.end = region_start;
++  if (block.begin == block.end) {
++    hoist_blocks_.pop_back();
++  }
++  write_stream_ = &command_stream_;
++}
++
++void DeferredCommandBuffer::AppendRaw(const std::vector<uintmax_t>& commands) {
++  assert_true(write_stream_ == &command_stream_);
++  command_stream_.insert(command_stream_.end(), commands.begin(), commands.end());
++}
++
++DeferredCommandBuffer::ProfilePool* DeferredCommandBuffer::ProfileBegin(
++    VkCommandBuffer command_buffer) {
++  if (profile_failed_) {
++    return nullptr;
++  }
++  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  ProfilePool& pool = profile_pools_[profile_pool_index_];
++  if (pool.pool == VK_NULL_HANDLE) {
++    if (profile_pool_index_ == 0) {
++      VkPhysicalDeviceProperties properties;
++      vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
++          vulkan_device->physical_device(), &properties);
++      timestamp_period_ns_ = properties.limits.timestampPeriod;
++      if (!properties.limits.timestampComputeAndGraphics) {
++        REXGPU_WARN("gpuprof: the device has no graphics/compute timestamps");
++        profile_failed_ = true;
++        return nullptr;
++      }
++      REXGPU_INFO("gpuprof: on, timestamp period {} ns", timestamp_period_ns_);
++    }
++    VkQueryPoolCreateInfo pool_info = {};
++    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
++    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++    pool_info.queryCount = kProfileQueriesPerPool;
++    if (dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr, &pool.pool) !=
++        VK_SUCCESS) {
++      REXGPU_WARN("gpuprof: vkCreateQueryPool failed");
++      profile_failed_ = true;
++      return nullptr;
++    }
++  } else if (pool.pending) {
++    ProfileCollect(pool);
++    if (pool.pending) {
++      // The submission that used this pool has not finished: skip timing this one.
++      return nullptr;
++    }
++  }
++  profile_pool_index_ = (profile_pool_index_ + 1) % kProfilePoolCount;
++  dfn.vkCmdResetQueryPool(command_buffer, pool.pool, 0, kProfileQueriesPerPool);
++  pool.stamps.clear();
++  pool.pending = true;
++  ProfileStampWrite(command_buffer, &pool, kSegOther);
++  return &pool;
++}
++
++void DeferredCommandBuffer::ProfileStampWrite(VkCommandBuffer command_buffer, ProfilePool* pool,
++                                              SegmentKind kind, uint32_t draws, uint32_t width,
++                                              uint32_t height) {
++  if (pool->stamps.size() >= kProfileQueriesPerPool) {
++    return;
++  }
++  command_processor_.GetVulkanDevice()->functions().vkCmdWriteTimestamp(
++      command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool->pool,
++      uint32_t(pool->stamps.size()));
++  pool->stamps.push_back({uint8_t(kind), draws, width, height});
++}
++
++void DeferredCommandBuffer::ProfileCollect(ProfilePool& pool) {
++  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
++  const uint32_t count = uint32_t(pool.stamps.size());
++  if (count < 2) {
++    pool.pending = false;
++    return;
++  }
++  static thread_local std::vector<uint64_t> results;
++  results.resize(count);
++  if (vulkan_device->functions().vkGetQueryPoolResults(
++          vulkan_device->device(), pool.pool, 0, count, sizeof(uint64_t) * count, results.data(),
++          sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
++    return;  // VK_NOT_READY: still pending
++  }
++  pool.pending = false;
++  const double ms_per_tick = double(timestamp_period_ns_) / 1e6;
++  for (uint32_t i = 1; i < count; ++i) {
++    const ProfileStamp& stamp = pool.stamps[i];
++    const double ms =
++        results[i] > results[i - 1] ? double(results[i] - results[i - 1]) * ms_per_tick : 0.0;
++    profile_window_ms_[stamp.kind] += ms;
++    ++profile_window_count_[stamp.kind];
++    if (stamp.kind != kSegOther && ms > 0.25) {
++      profile_top_.push_back({ms, stamp.kind, stamp.draws, stamp.width, stamp.height});
++    }
++  }
++  profile_window_span_ms_ +=
++      results[count - 1] > results[0] ? double(results[count - 1] - results[0]) * ms_per_tick : 0.0;
++  ++profile_window_submissions_;
++
++  const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                       std::chrono::steady_clock::now().time_since_epoch())
++                                       .count());
++  if (!profile_window_start_ns_) {
++    profile_window_start_ns_ = now_ns;
++  }
++  if (now_ns - profile_window_start_ns_ < 3000000000ull) {
++    return;
++  }
++  const double n = double(profile_window_submissions_);
++  REXGPU_INFO(
++      "gpuprof: {} submissions, GPU ms per submission: span {:.2f} | guest passes {:.2f} ({:.0f}) | "
++      "rt-cache passes {:.2f} ({:.0f}) | present {:.2f} | dispatch {:.2f} ({:.0f}) | hoisted {:.2f} "
++      "({:.0f}) | other {:.2f}",
++      profile_window_submissions_, profile_window_span_ms_ / n, profile_window_ms_[kSegPassGuest] / n,
++      profile_window_count_[kSegPassGuest] / n, profile_window_ms_[kSegPassRenderTargetCache] / n,
++      profile_window_count_[kSegPassRenderTargetCache] / n, profile_window_ms_[kSegPassPresent] / n,
++      profile_window_ms_[kSegDispatch] / n, profile_window_count_[kSegDispatch] / n,
++      profile_window_ms_[kSegHoisted] / n, profile_window_count_[kSegHoisted] / n,
++      profile_window_ms_[kSegOther] / n);
++  std::sort(profile_top_.begin(), profile_top_.end(),
++            [](const ProfileTop& a, const ProfileTop& b) { return a.ms > b.ms; });
++  GpuProfileCounters& counters = gpu_profile_counters();
++  REXGPU_INFO(
++      "gpuprof: per submission: {:.0f} guest memory uploads, {:.0f} KB; {:.1f} texture loads, {:.0f} KB",
++      double(counters.uploads.exchange(0)) / n, double(counters.upload_bytes.exchange(0)) / 1024.0 / n,
++      double(counters.texture_loads.exchange(0)) / n,
++      double(counters.texture_load_bytes.exchange(0)) / 1024.0 / n);
++  static const char* const kKindNames[] = {"guest",    "rt-cache", "present",
++                                           "dispatch", "other",    "hoisted"};
++  for (size_t i = 0; i < std::min<size_t>(profile_top_.size(), 12); ++i) {
++    const ProfileTop& top = profile_top_[i];
++    REXGPU_INFO("gpuprof:   {:.2f} ms {} draws={} {}x{}", top.ms, kKindNames[top.kind], top.draws,
++                top.width, top.height);
++  }
++  profile_top_.clear();
++  profile_window_start_ns_ = now_ns;
++  profile_window_submissions_ = 0;
++  profile_window_span_ms_ = 0.0;
++  for (uint32_t i = 0; i < kSegKindCount; ++i) {
++    profile_window_ms_[i] = 0.0;
++    profile_window_count_[i] = 0;
++  }
++}
++
+ void DeferredCommandBuffer::CmdVkPipelineBarrier(
+     VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
+     VkDependencyFlags dependency_flags, uint32_t memory_barrier_count,
+@@ -396,6 +761,8 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
+   args.layer_count = rendering_info->layerCount;
+   args.view_mask = rendering_info->viewMask;
+   args.color_attachment_count = rendering_info->colorAttachmentCount;
++  args.profile_kind = next_pass_kind_;
++  next_pass_kind_ = kPassGuest;
+   args.has_depth_attachment = rendering_info->pDepthAttachment != nullptr;
+   args.has_stencil_attachment = rendering_info->pStencilAttachment != nullptr;
+ 
+@@ -411,17 +778,23 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
+     std::memcpy(args_ptr + stencil_attachment_offset, rendering_info->pStencilAttachment,
+                 sizeof(VkRenderingAttachmentInfo));
+   }
++  BeginPassArea(args_ptr + offsetof(ArgsVkBeginRendering, render_area));
++  open_pass_header_offset_ =
++      size_t(reinterpret_cast<uintmax_t*>(args_ptr) - command_stream_.data()) -
++      kCommandHeaderSizeElements;
++  ++pass_serial_;
+ }
+ 
+ void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
+   size_t arguments_size_elements =
+       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+-  size_t offset = command_stream_.size();
+-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
+-  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
++  std::vector<uintmax_t>& command_stream = *write_stream_;
++  size_t offset = command_stream.size();
++  command_stream.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
++  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream.data() + offset);
+   header.command = command;
+   header.arguments_size_elements = uint32_t(arguments_size_elements);
+-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
++  return command_stream.data() + (offset + kCommandHeaderSizeElements);
+ }
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 91ac08f..c3fcd52 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
+@@ -55,6 +56,10 @@ REXCVAR_DEFINE_INT32(
+     .range(-1, 32)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_pipeline_cache_file, true, "GPU/Vulkan",
++                    "Keep the driver's compiled pipelines across runs in vulkan_pipeline_cache.bin in the "
++                    "shader cache directory (android: pipeline creation causes in-game hitches)");
++
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -391,6 +396,7 @@ bool VulkanPipelineCache::Initialize() {
+ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                   uint32_t title_id, bool blocking) {
+   ShutdownShaderStorage();
++  LoadVulkanPipelineCache(cache_root);
+   {
+     std::lock_guard<std::mutex> lock(creation_request_lock_);
+     startup_loading_ = false;
+@@ -741,6 +747,110 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
+ 
+   shader_storage_cache_root_.clear();
+   shader_storage_title_id_ = 0;
++
++  SaveVulkanPipelineCache(true);
++}
++
++void VulkanPipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& cache_root) {
++  if (vk_pipeline_cache_ != VK_NULL_HANDLE || !REXCVAR_GET(vulkan_pipeline_cache_file)) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
++  vk_pipeline_cache_path_ = cache_root / "vulkan_pipeline_cache.bin";
++  std::vector<uint8_t> data;
++  if (FILE* file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "rb")) {
++    fseek(file, 0, SEEK_END);
++    long size = ftell(file);
++    fseek(file, 0, SEEK_SET);
++    if (size > 0) {
++      data.resize(size_t(size));
++      if (fread(data.data(), 1, data.size(), file) != data.size()) {
++        data.clear();
++      }
++    }
++    fclose(file);
++  }
++  // Only data from this device and driver (VkPipelineCacheHeaderVersionOne).
++  if (!data.empty()) {
++    VkPhysicalDeviceProperties properties;
++    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
++        vulkan_device->physical_device(), &properties);
++    uint32_t header[4];
++    bool valid = data.size() >= 16 + VK_UUID_SIZE;
++    if (valid) {
++      std::memcpy(header, data.data(), sizeof(header));
++      valid = header[0] >= 16 + VK_UUID_SIZE && header[1] == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
++              header[2] == properties.vendorID && header[3] == properties.deviceID &&
++              !std::memcmp(data.data() + 16, properties.pipelineCacheUUID, VK_UUID_SIZE);
++    }
++    if (!valid) {
++      REXGPU_INFO("VulkanPipelineCache: {} is from another device or driver, starting over",
++                  rex::path_to_utf8(vk_pipeline_cache_path_));
++      data.clear();
++    }
++  }
++  VkPipelineCacheCreateInfo create_info = {};
++  create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++  create_info.initialDataSize = data.size();
++  create_info.pInitialData = data.empty() ? nullptr : data.data();
++  if (vulkan_device->functions().vkCreatePipelineCache(vulkan_device->device(), &create_info, nullptr,
++                                                       &vk_pipeline_cache_) != VK_SUCCESS) {
++    vk_pipeline_cache_ = VK_NULL_HANDLE;
++    REXGPU_WARN("VulkanPipelineCache: vkCreatePipelineCache failed");
++    return;
++  }
++  REXGPU_INFO("VulkanPipelineCache: driver pipeline cache {} ({} bytes loaded)",
++              rex::path_to_utf8(vk_pipeline_cache_path_), data.size());
++}
++
++void VulkanPipelineCache::SaveVulkanPipelineCache(bool force) {
++  if (vk_pipeline_cache_ == VK_NULL_HANDLE) {
++    return;
++  }
++  const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                       std::chrono::steady_clock::now().time_since_epoch())
++                                       .count());
++  if (!force) {
++    // At most every 10 seconds, and only after new pipelines.
++    if (!vk_pipeline_cache_unsaved_.load(std::memory_order_relaxed) ||
++        now_ms - vk_pipeline_cache_last_save_ms_.load(std::memory_order_relaxed) < 10000) {
++      return;
++    }
++  }
++  std::unique_lock<std::mutex> lock(vk_pipeline_cache_save_mutex_, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    return;  // Another thread is saving.
++  }
++  vk_pipeline_cache_last_save_ms_.store(now_ms, std::memory_order_relaxed);
++  vk_pipeline_cache_unsaved_.store(0, std::memory_order_relaxed);
++  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  size_t size = 0;
++  if (dfn.vkGetPipelineCacheData(vulkan_device->device(), vk_pipeline_cache_, &size, nullptr) !=
++          VK_SUCCESS ||
++      !size) {
++    return;
++  }
++  std::vector<uint8_t> data(size);
++  if (dfn.vkGetPipelineCacheData(vulkan_device->device(), vk_pipeline_cache_, &size,
++                                 data.data()) != VK_SUCCESS) {
++    return;
++  }
++  // Written next to the file and renamed over it: a kill mid-write leaves the old file.
++  std::filesystem::path temp_path = vk_pipeline_cache_path_;
++  temp_path += ".tmp";
++  FILE* file = rex::filesystem::OpenFile(temp_path, "wb");
++  if (!file) {
++    return;
++  }
++  const bool written = fwrite(data.data(), 1, size, file) == size;
++  fclose(file);
++  std::error_code error;
++  if (written) {
++    std::filesystem::rename(temp_path, vk_pipeline_cache_path_, error);
++  } else {
++    std::filesystem::remove(temp_path, error);
++  }
+ }
+ 
+ void VulkanPipelineCache::EndSubmission() {
+@@ -804,6 +914,14 @@ void VulkanPipelineCache::Shutdown() {
+     }
+     creation_threads_.clear();
+   }
++  // android: the driver pipeline cache (LoadVulkanPipelineCache).
++  SaveVulkanPipelineCache(true);
++  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
++    const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
++    vulkan_device->functions().vkDestroyPipelineCache(vulkan_device->device(), vk_pipeline_cache_,
++                                                      nullptr);
++    vk_pipeline_cache_ = VK_NULL_HANDLE;
++  }
+   {
+     std::lock_guard<std::mutex> lock(creation_request_lock_);
+     while (!creation_queue_.empty()) {
+@@ -3480,8 +3598,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
+-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+-                                                         &pipeline_create_info, nullptr, &pipeline);
++  VkResult create_result = dfn.vkCreateGraphicsPipelines(
++      device, vk_pipeline_cache_, 1, &pipeline_create_info, nullptr, &pipeline);
++  if (create_result == VK_SUCCESS && vk_pipeline_cache_ != VK_NULL_HANDLE) {
++    // Saved by StorageWriteThread.
++    vk_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed);
++  }
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+@@ -3670,7 +3792,18 @@ void VulkanPipelineCache::StorageWriteThread() {
+         flush_pipelines = true;
+       }
+       if (!shader && !write_pipeline) {
+-        storage_write_request_cond_.wait(lock);
++        // android: idle - save the driver pipeline cache if pipelines were created (here, not on the
++        // creating threads, which may be the GPU command thread), and wake up at least every 10 seconds
++        // for that.
++        lock.unlock();
++        SaveVulkanPipelineCache(false);
++        lock.lock();
++        if (storage_write_thread_shutdown_ || !storage_write_shader_queue_.empty() ||
++            !storage_write_pipeline_queue_.empty() || storage_write_flush_shaders_ ||
++            storage_write_flush_pipelines_) {
++          continue;
++        }
++        storage_write_request_cond_.wait_for(lock, std::chrono::seconds(10));
+         continue;
+       }
+     }
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 6788214..a9cafb4 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -27,6 +27,11 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                     "Use sparse shared memory on Vulkan")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
++                    "Record guest memory uploads needed while a render pass is open before that pass "
++                    "instead of ending it, when no earlier draw of the pass reads the uploaded pages "
++                    "(android: every render pass split costs a tile load and store on mobile GPUs)");
++
+ namespace rex::graphics::vulkan {
+ 
+ VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
+@@ -275,13 +280,30 @@ bool VulkanSharedMemory::UploadRanges(
+   }
+   // upload_page_ranges are sorted, use them to determine the range for the
+   // ordering barrier.
+-  Use(Usage::kTransferDestination,
+-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
+-                      upload_page_ranges.front().first)
+-                         << page_size_log2()));
+-  command_processor_.SubmitBarriers(true);
++  const uint32_t upload_start = upload_page_ranges.front().first << page_size_log2();
++  const uint32_t upload_length = (upload_page_ranges.back().first + upload_page_ranges.back().second -
++                                  upload_page_ranges.front().first)
++                                 << page_size_log2();
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++  // android: inside a hoisted region (texture loads) the upload takes the normal path, recorded into the
++  // region, unless draws already in the pass read these pages: then the region is given up.
++  if (command_processor_.IsHoistingRegion() && OverlapsPassReads(upload_start, upload_length)) {
++    command_processor_.AbortHoistRegion();
++  }
++  // android: the copy runs before the open render pass instead of ending it (see CanHoistUpload).
++  const bool hoist =
++      !command_processor_.IsHoistingRegion() && CanHoistUpload(upload_start, upload_length);
++  VkPipelineStageFlags read_stage_mask;
++  VkAccessFlags read_access_mask;
++  if (hoist) {
++    // The barriers around the hoisted copies (one pair per render pass) are written by
++    // DeferredCommandBuffer::Execute.
++    GetUsageMasks(Usage::kRead, read_stage_mask, read_access_mask);
++    command_buffer.BeginHoist(buffer_, read_stage_mask, read_access_mask);
++  } else {
++    Use(Usage::kTransferDestination, std::make_pair(upload_start, upload_length));
++    command_processor_.SubmitBarriers(true);
++  }
+   uint64_t submission_current = command_processor_.GetCurrentSubmission();
+   bool successful = true;
+   upload_regions_.clear();
+@@ -301,6 +323,8 @@ bool VulkanSharedMemory::UploadRanges(
+         break;
+       }
+       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
++      gpu_profile_counters().uploads.fetch_add(1, std::memory_order_relaxed);
++      gpu_profile_counters().upload_bytes.fetch_add(upload_buffer_size, std::memory_order_relaxed);
+       std::memcpy(upload_buffer_mapping,
+                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
+                   upload_buffer_size);
+@@ -329,9 +353,71 @@ bool VulkanSharedMemory::UploadRanges(
+                                    uint32_t(upload_regions_.size()), upload_regions_.data());
+     upload_regions_.clear();
+   }
++  if (hoist) {
++    command_buffer.EndHoist();
++  }
+   return successful;
+ }
+ 
++bool VulkanSharedMemory::CanHoistUpload(uint32_t start, uint32_t length) {
++  if (!REXCVAR_GET(vulkan_hoist_shared_memory_uploads)) {
++    return false;
++  }
++  // Only while a render pass is open (otherwise nothing is split), and only when the buffer is in the
++  // plain read state: pending GPU writes (memexport, resolves) must stay ordered with the upload.
++  if (!command_processor_.deferred_command_buffer().IsRenderPassOpen() ||
++      last_usage_ != Usage::kRead || last_written_range_.second) {
++    return false;
++  }
++  // Earlier draws of the pass must keep seeing the old contents.
++  return !OverlapsPassReads(start, length);
++}
++
++bool VulkanSharedMemory::OverlapsPassReads(uint32_t start, uint32_t length) {
++  SyncPassReads();
++  if (pass_read_all_) {
++    return true;
++  }
++  const uint64_t end = uint64_t(start) + length;
++  for (const std::pair<uint32_t, uint32_t>& range : pass_read_ranges_) {
++    if (range.first < end && uint64_t(range.first) + range.second > start) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void VulkanSharedMemory::SyncPassReads() {
++  const uint64_t serial = command_processor_.deferred_command_buffer().pass_serial();
++  if (pass_read_serial_ != serial) {
++    pass_read_serial_ = serial;
++    pass_read_all_ = false;
++    pass_read_ranges_.clear();
++  }
++}
++
++void VulkanSharedMemory::NoteRangeRead(uint32_t start, uint32_t length) {
++  if (!length) {
++    return;
++  }
++  SyncPassReads();
++  if (pass_read_all_) {
++    return;
++  }
++  if (pass_read_ranges_.size() >= 1024) {
++    pass_read_all_ = true;
++    return;
++  }
++  pass_read_ranges_.emplace_back(start, length);
++}
++
++void VulkanSharedMemory::OnRangesRequested(
++    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
++  for (const std::pair<uint32_t, uint32_t>& range : ranges) {
++    NoteRangeRead(range.first, range.second);
++  }
++}
++
+ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
+                                        VkAccessFlags& access_mask) const {
+   switch (usage) {
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..ccf59ff 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -1371,6 +1371,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   if (scratch_buffer == VK_NULL_HANDLE) {
+     return false;
+   }
++  gpu_profile_counters().texture_loads.fetch_add(1, std::memory_order_relaxed);
++  gpu_profile_counters().texture_load_bytes.fetch_add(host_buffer_size, std::memory_order_relaxed);
+ 
+   // Begin loading.
+   // TODO(Triang3l): Going from one descriptor to another on per-array-layer
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..280a68b 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -55,8 +55,15 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+ }  // namespace
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
++#if REX_PLATFORM_ANDROID
++  // android: the plugin is one of the APK's native libraries; the linker finds it by name in the app's library
++  // directory.
++  std::filesystem::path path = PluginFileName(name);
++  if (false) {
++#else
+   auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
+   if (!std::filesystem::exists(path)) {
++#endif
+     REXSYS_ERROR(
+         "GPU plugin '{}' not found at {}. Stage it next to the executable "
+         "(GPU_PLUGINS {} in rexglue_configure_target).",
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b93005..8523e21 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -406,6 +406,7 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     // clears the watch we just hit).
+     // Do this under the lock so we don't introduce another race condition.
+     auto lock = global_critical_region_.Acquire();
++#if !REX_PLATFORM_LINUX
+     memory::PageAccess cur_access;
+     size_t page_length = memory::page_size();
+     memory::QueryProtect(fault_host_address, page_length, cur_access);
+@@ -414,6 +415,11 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+       // Another thread has cleared this watch. Abort.
+       return true;
+     }
++#endif
++    // android: on Linux QueryProtect parses all of /proc/self/maps (thousands of lines in an Android app): it
++    // was 80% of the guest render thread, on every write to a GPU-watched page. The callback below makes the
++    // same decision from the heap's own state under this lock: a watch another thread already cleared ends in
++    // its stale-protection recovery, which restores write access and resumes.
+     // The address is not found within any range, so either a write watch or an
+     // actual access violation.
+     if (access_violation_callback_) {
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..0a16ce0 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -609,10 +610,15 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
+                                rex::memory::PageAccess::kReadWrite, nullptr)) {
+-        REXSYS_WARN(
+-            "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
+-            "guest_protect {:08X})",
+-            virtual_address, static_cast<uint64_t>(page_base), guest_protect);
++        // android: on Linux this path also ends ordinary watch races (mmio_handler.cpp no longer pre-checks
++        // the host protection), so only the first occurrences are logged
++        static std::atomic<uint32_t> recovered_logged{0};
++        if (recovered_logged.fetch_add(1, std::memory_order_relaxed) < 20) {
++          REXSYS_WARN(
++              "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
++              "guest_protect {:08X})",
++              virtual_address, static_cast<uint64_t>(page_base), guest_protect);
++        }
+         return true;
+       }
+     }
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..bd2c538 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -72,6 +72,11 @@ elseif(APPLE)
+     set(REXUI_PLATFORM_SOURCES
+         surface_mac.cpp
+     )
++elseif(ANDROID)
++    # android: ANativeWindow surface (surface_android.cpp)
++    set(REXUI_PLATFORM_SOURCES
++        surface_android.cpp
++    )
+ else()
+     set(REXUI_PLATFORM_SOURCES
+         surface_gnulinux.cpp
+@@ -146,7 +151,10 @@ if(REXGLUE_USE_VULKAN)
+ endif()
+ 
+ # Platform-specific dependencies
+-if(UNIX AND NOT APPLE)
++if(ANDROID)
++    # android: ANativeWindow_* comes from libandroid
++    target_link_libraries(rexui PUBLIC android log)
++elseif(UNIX AND NOT APPLE)
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
+diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
+new file mode 100644
+index 0000000..51cc5cb
+--- /dev/null
++++ b/src/ui/surface_android.cpp
+@@ -0,0 +1,25 @@
++/**
++ * android: size of the ANativeWindow behind the SDL3 window (see surface_android.h).
++ */
++
++#include <rex/ui/surface_android.h>
++
++namespace rex {
++namespace ui {
++
++bool AndroidNativeWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
++  if (!window_) {
++    return false;
++  }
++  int32_t width = ANativeWindow_getWidth(window_);
++  int32_t height = ANativeWindow_getHeight(window_);
++  if (width <= 0 || height <= 0) {
++    return false;
++  }
++  width_out = uint32_t(width);
++  height_out = uint32_t(height);
++  return true;
++}
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..022f612 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -35,6 +35,8 @@
+ #include <SDL3/SDL_metal.h>
+ 
+ #include <rex/ui/surface_mac.h>
++#elif REX_PLATFORM_ANDROID
++#include <rex/ui/surface_android.h>  // android
+ #else
+ #include <X11/Xlib-xcb.h>
+ #include <rex/ui/surface_gnulinux.h>
+@@ -398,6 +400,15 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+       SDL_Metal_DestroyView(metal_view);
+     }
+   }
++#elif REX_PLATFORM_ANDROID
++  // android: SDL3 exposes the activity's ANativeWindow as a window property.
++  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
++    auto* native_window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
++        SDL_GetWindowProperties(sdl_window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
++    if (native_window) {
++      return std::make_unique<AndroidNativeWindowSurface>(native_window);
++    }
++  }
+ #else
+   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
+index 77bb1dc..de966d5 100644
+--- a/src/ui/windowed_app_main_sdl.cpp
++++ b/src/ui/windowed_app_main_sdl.cpp
+@@ -34,6 +34,18 @@
+ #include <shellapi.h>
+ #endif
+ 
++#if REX_PLATFORM_ANDROID
++#include <android/log.h>
++#include <unistd.h>
++
++#include <cstdio>
++#include <cstring>
++
++#include <SDL3/SDL_system.h>
++
++#include <rex/main_android.h>
++#endif
++
+ namespace {
+ 
+ int RunWindowedApp(int argc, char** argv) {
+@@ -124,6 +136,68 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+   return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+ }
+ 
++#elif REX_PLATFORM_ANDROID
++
++// android: SDL3's Java activity (SDLActivity) loads the app as libmain.so and calls SDL_main on its own thread.
++// Before the app runs: the files directory becomes the working directory and REX_ANDROID_FILES_DIR (the
++// executable/user folder, rex/main_android.h), stdout and stderr go to <files>/log.txt (the previous start's log
++// is kept as log.prev.txt), the crash reporter is installed, and <files>/args.txt is appended to argv.
++extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[]) {
++  const char* files = SDL_GetAndroidExternalStoragePath();
++  if (!files) {
++    __android_log_print(ANDROID_LOG_ERROR, "rexglue", "no external storage path: %s", SDL_GetError());
++    return EXIT_FAILURE;
++  }
++  setenv("REX_ANDROID_FILES_DIR", files, 1);
++  (void)!chdir(files);
++  std::string log_path = std::string(files) + "/log.txt";
++  std::rename(log_path.c_str(), (std::string(files) + "/log.prev.txt").c_str());
++  if (std::freopen(log_path.c_str(), "w", stdout)) {
++    setvbuf(stdout, nullptr, _IOLBF, 0);
++    dup2(fileno(stdout), fileno(stderr));
++    setvbuf(stderr, nullptr, _IONBF, 0);
++  }
++  __android_log_print(ANDROID_LOG_INFO, "rexglue", "files directory %s, log %s", files, log_path.c_str());
++  rex::InitializeAndroid();
++
++  std::vector<std::string> args;
++  for (int i = 0; i < argc; ++i) {
++    args.emplace_back(argv[i] ? argv[i] : "");
++  }
++  if (args.empty()) {
++    args.emplace_back("rexglue");
++  }
++  if (FILE* file = std::fopen((std::string(files) + "/args.txt").c_str(), "r")) {
++    char word[1024];
++    while (std::fscanf(file, "%1023s", word) == 1) {
++      // NAME=value (no leading dash) sets an environment variable instead, e.g. MCLA_TIMING_LOG=1
++      const char* eq = std::strchr(word, '=');
++      if (word[0] != '-' && eq && eq != word) {
++        std::string name(word, size_t(eq - word));
++        setenv(name.c_str(), eq + 1, 1);
++        std::printf("rexglue android: env %s=%s\n", name.c_str(), eq + 1);
++        continue;
++      }
++      args.emplace_back(word);
++    }
++    std::fclose(file);
++  }
++  std::printf("rexglue android: files %s, api level %d, args:", files, rex::GetAndroidApiLevel());
++  for (const auto& arg : args) {
++    std::printf(" %s", arg.c_str());
++  }
++  std::printf("\n");
++  std::vector<char*> argv_ptrs;
++  for (auto& arg : args) {
++    argv_ptrs.push_back(arg.data());
++  }
++  argv_ptrs.push_back(nullptr);
++  int result = RunWindowedApp(int(args.size()), argv_ptrs.data());
++  std::printf("rexglue android: app returned %d\n", result);
++  std::fflush(stdout);
++  return result;
++}
++
+ #else
+ 
+ int main(int argc, char* argv[]) {
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..4eb4e47 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -290,7 +290,7 @@ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+ 
+ # Linux video and audio backends. Both video drivers are always built so the
+ # one in use stays a runtime choice.
+-if(UNIX AND NOT APPLE)
++if(UNIX AND NOT APPLE AND NOT ANDROID) # android: SDL's own Android video/audio (AAudio) drivers
+     set(SDL_X11               ON  CACHE BOOL "" FORCE)
+     set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
+     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)

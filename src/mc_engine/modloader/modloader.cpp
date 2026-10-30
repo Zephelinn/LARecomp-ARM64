@@ -2644,7 +2644,11 @@ bool ProbeAddress(uint32_t address) { return address >= 0x40000000u && address <
 void PartProbeLoop() {
     std::string last;
     for (;;) {
+#ifdef _WIN32
         Sleep(1000);
+#else
+        std::this_thread::sleep_for(std::chrono::seconds(1));  // android
+#endif
         if (!REXCVAR_GET(model_mods_part_probe)) continue;
         auto* runtime = rex::Runtime::instance();
         if (!runtime || !runtime->memory()) continue;
@@ -2723,10 +2727,15 @@ void PartProbeLoop() {
 void StartPartProbe() {
     static std::once_flag once;
     std::call_once(once, [] {
+#ifdef _WIN32
         HANDLE thread = CreateThread(
             nullptr, 0, [](LPVOID) -> DWORD { PartProbeLoop(); return 0; }, nullptr, 0, nullptr);
         LARECOMP_APP_INFO("[mods-probe] started ({})", thread ? "thread up" : "CreateThread failed");
         if (thread) CloseHandle(thread);
+#else
+        std::thread(PartProbeLoop).detach();  // android
+        LARECOMP_APP_INFO("[mods-probe] started (thread up)");
+#endif
     });
 }
 

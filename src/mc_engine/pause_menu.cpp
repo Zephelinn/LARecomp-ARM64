@@ -644,7 +644,18 @@ void SetDeferred(const char* name, const char* value) {
 // load on the next launch.
 std::string TomlValue(const std::string& key, const std::string& value) {
     const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(key);
-    if (!info || info->type != rex::cvar::FlagType::String) return value;
+    if (info && info->type != rex::cvar::FlagType::String) return value;
+    if (!info) {
+        // A cvar this build does not register (graphics_backend without the native renderer, as on
+        // Android): bare only when the text is already a TOML boolean or number. `graphics_backend = auto`
+        // made the whole file fail to load, so no setting survived a restart.
+        if (value == "true" || value == "false") return value;
+        char* end = nullptr;
+        if (!value.empty()) {
+            std::strtod(value.c_str(), &end);
+            if (end && *end == '\0') return value;
+        }
+    }
     std::string quoted = "\"";
     for (const char c : value) {
         if (c == '"' || c == '\\') quoted += '\\';

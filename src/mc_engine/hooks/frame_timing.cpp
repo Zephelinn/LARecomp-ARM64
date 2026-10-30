@@ -135,6 +135,16 @@ bool Patch_FenceSpinThrottle() {
         }
         s_spin_count = 0;
     }
+#else
+    // android: without this the guest spun flat out on a big core while waiting for the GPU, which on a
+    // phone-class chip is heat, and heat is clock speed. A 50 us nap every 16 reaches still answers the fence
+    // within a fraction of a frame.
+    static thread_local uint32_t s_spin_count = 0;
+    if (kCount) g_fence_hook_calls.fetch_add(1, std::memory_order_relaxed);
+    if (++s_spin_count >= 16) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        s_spin_count = 0;
+    }
 #endif
     return true;
 }

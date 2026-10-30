@@ -45,7 +45,7 @@
 #include <commdlg.h>
 #include <windows.h>
 
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)  // android: no desktop file dialogs
 #else
 #include <gtk/gtk.h>
 #endif
@@ -543,7 +543,7 @@ fs::path PickSaveFile() {
   }
   return filename;
 }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__ANDROID__)  // android: no file dialog
 fs::path PickSaveFile() { return {}; }
 #else
 fs::path PickSaveFile() {

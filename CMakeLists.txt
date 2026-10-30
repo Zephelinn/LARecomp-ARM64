@@ -150,6 +150,31 @@ set(LARECOMP_SOURCES
     src/mc_engine/online/leaderboards/lb_protocol.cpp
     src/mc_engine/online/leaderboards/lb_store.cpp
 
+
+    src/achievement_metadata.cpp
+
+    src/discord_rpc/rpc_client.cpp
+    src/discord_rpc/discord_rpc.cpp
+    src/discord_rpc/discord_hooks.cpp
+
+    src/isoinstaller/larecomp_iso_installer.cpp
+    src/isoinstaller/install_wizard_dialog.cpp
+    src/saveporter/larecomp_save_porter.cpp
+    src/profile/larecomp_profile_store.cpp
+    src/profile/larecomp_profile_picker.cpp
+    src/bootprogress/larecomp_boot_progress.cpp
+    src/mc_engine/ui/fonts/larecomp_embedded_fonts.cpp
+    src/mc_engine/ui/imgui_theme.cpp
+    src/mc_engine/ui/debug_overlay.cpp
+    src/mc_engine/ui/controller_toast.cpp
+    src/mc_engine/ui/gamepad.cpp
+    src/mc_engine/ui/settings.cpp
+    src/mc_engine/ui/achievements.cpp
+    src/mc_engine/ui/kerning.cpp
+)
+# android: the probe and the Native Graphics Runtime are D3D12-only (and off by default: the game draws through
+# the SDK's Xenos GPU plugin). Elsewhere native_gfx_off.cpp stands in for the few entry points the app calls.
+set(LARECOMP_NATIVE_GFX_SOURCES
     # MILESTONE 0 - temporary passive instrumentation, cvar-gated (default off).
     # Remove this line and the src/native_probe/ directory once the Native
     # Graphics Runtime research is closed.
@@ -207,28 +232,12 @@ set(LARECOMP_SOURCES
     src/native_gfx/d3d12/gpu_profiler.cpp
     src/native_gfx/d3d12/barrier_batch.cpp
     src/native_gfx/d3d12/untile_pass.cpp
-
-    src/achievement_metadata.cpp
-
-    src/discord_rpc/rpc_client.cpp
-    src/discord_rpc/discord_rpc.cpp
-    src/discord_rpc/discord_hooks.cpp
-
-    src/isoinstaller/larecomp_iso_installer.cpp
-    src/isoinstaller/install_wizard_dialog.cpp
-    src/saveporter/larecomp_save_porter.cpp
-    src/profile/larecomp_profile_store.cpp
-    src/profile/larecomp_profile_picker.cpp
-    src/bootprogress/larecomp_boot_progress.cpp
-    src/mc_engine/ui/fonts/larecomp_embedded_fonts.cpp
-    src/mc_engine/ui/imgui_theme.cpp
-    src/mc_engine/ui/debug_overlay.cpp
-    src/mc_engine/ui/controller_toast.cpp
-    src/mc_engine/ui/gamepad.cpp
-    src/mc_engine/ui/settings.cpp
-    src/mc_engine/ui/achievements.cpp
-    src/mc_engine/ui/kerning.cpp
 )
+if(WIN32)
+    list(APPEND LARECOMP_SOURCES ${LARECOMP_NATIVE_GFX_SOURCES})
+else()
+    list(APPEND LARECOMP_SOURCES src/native_gfx/native_gfx_off.cpp)
+endif()
 if(REXGLUE_ENABLE_XEO3_TARGET)
     # The XEO3 DLL is a separate build, not a variant of this one: it needs the
     # XEO3 Clang fork (this project's compiler cannot produce the calling
@@ -285,6 +294,12 @@ else()
 
         add_executable(larecomp WIN32 ${LARECOMP_SOURCES} src/larecomp.rc
                        "${CMAKE_CURRENT_BINARY_DIR}/keycaps.rc")
+    elseif(ANDROID)
+        # android: SDL3's Java activity loads the game as libmain.so and calls its SDL_main (the SDK's
+        # windowed_app_main_sdl.cpp, added by rexglue_setup_target).
+        add_library(larecomp SHARED ${LARECOMP_SOURCES})
+        set_target_properties(larecomp PROPERTIES OUTPUT_NAME main)
+        target_link_libraries(larecomp PRIVATE android log)
     else()
         add_executable(larecomp ${LARECOMP_SOURCES})
     endif()
