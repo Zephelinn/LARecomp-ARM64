@@ -66,8 +66,8 @@ cp $W/dex/classes.dex $W/pkg/
 $BT/zipalign -f -P 16 4 $W/base.apk $W/aligned.apk || exit 1
 NAME=${APK_NAME:-larecomp$SUF}; [ -z "$SUF" ] && NAME=${APK_NAME:-larecomp-debug}
 if [ -n "$RELEASE_KEYSTORE" ]; then
-  # public releases: the user's release key (never in a repository; updates must use the same key)
-  $BT/apksigner sign --ks $RELEASE_KEYSTORE --ks-pass file:$RELEASE_PASS_FILE --key-pass file:$RELEASE_PASS_FILE \
+  # release signing: your own keystore, alias RELEASE_ALIAS (never in the repository; updates need the same key)
+  $BT/apksigner sign --ks $RELEASE_KEYSTORE --ks-key-alias ${RELEASE_ALIAS:-release} --ks-pass file:$RELEASE_PASS_FILE \
     --out $OUT/$NAME.apk $W/aligned.apk || exit 1
 else
   $BT/apksigner sign --ks $A/debug.keystore --ks-pass pass:android --key-pass pass:android --out $OUT/$NAME.apk $W/aligned.apk || exit 1
